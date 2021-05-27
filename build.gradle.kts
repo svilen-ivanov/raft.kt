@@ -1,5 +1,6 @@
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 import dev.svilenivanov.raftkt.gradle.Version
+import org.gradle.jvm.tasks.Jar
 
 plugins {
     @Suppress("RemoveRedundantQualifierName")
@@ -32,10 +33,14 @@ subprojects {
         }
     }
 
-    tasks.withType<org.gradle.jvm.tasks.Jar>().configureEach {
+    tasks.withType<Jar>().configureEach {
         archiveBaseName.set(rootProject.name)
         archiveAppendix.set(project.name)
         archiveVersion.set(rootProject.version.toString())
+    }
+
+    tasks.withType<Test>().configureEach {
+        useJUnitPlatform()
     }
 }
 

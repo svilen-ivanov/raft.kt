@@ -23,7 +23,7 @@ subprojects {
             kotlinOptions {
                 allWarningsAsErrors = true
                 jvmTarget = Version.java
-                freeCompilerArgs = listOf("-Xopt-in=kotlin.RequiresOptIn")
+                freeCompilerArgs = listOf("-Xopt-in=kotlin.RequiresOptIn", "-Xopt-in=kotlin.time.ExperimentalTime", "-Xopt-in=kotlinx.coroutines.ExperimentalCoroutinesApi")
             }
         }
 

@@ -10,12 +10,10 @@ plugins {
 }
 
 dependencies {
+    implementation(project(":core"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:${Version.coroutines}")
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-core:${Version.serialization}")
     implementation("org.jetbrains.kotlinx:kotlinx-datetime:${Version.dateTime}")
-    api("org.slf4j:slf4j-api:${Version.slf4jApi}")
 
-    testImplementation(project(":inmem"))
     testImplementation(kotlin("test"))
     testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:${Version.serialization}")
     testImplementation("io.kotest:kotest-assertions-core:${Version.kotest}")

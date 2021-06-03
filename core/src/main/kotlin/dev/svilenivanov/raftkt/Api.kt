@@ -62,7 +62,7 @@ class Raft<T, E> private constructor(
 
     @Suppress("UNUSED_VARIABLE")
     suspend fun init() {
-        val currentTerm = stable.getCurrentTerm() ?: throw IllegalStateException("failed to load current term")
+        val currentTerm = stable.get("currentTerm".toByteArray()) ?: throw IllegalStateException("failed to load current term")
 
         val lastIndex = logs.lastIndex() ?: throw IllegalStateException("failed to find last log")
         val lastLog = if (lastIndex > 0) {

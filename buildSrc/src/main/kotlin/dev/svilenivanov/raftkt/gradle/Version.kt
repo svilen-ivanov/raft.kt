@@ -12,4 +12,6 @@ object Version {
     const val slf4jApi = "1.7.30" // https://search.maven.org/artifact/org.slf4j/slf4j-api
     const val log4j2 = "2.14.1" // https://search.maven.org/artifact/org.apache.logging.log4j/log4j-slf4j-impl
     const val kotest = "4.6.0" // https://search.maven.org/search?q=g:io.kotest%20AND%20a:kotest-runner-junit5
+    const val dateTime = "0.2.1" // https://search.maven.org/artifact/org.jetbrains.kotlinx/kotlinx-datetime
+    const val atomicfu = "0.16.1" // https://search.maven.org/artifact/org.jetbrains.kotlinx/atomicfu
 }

@@ -2,6 +2,13 @@ import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 import dev.svilenivanov.raftkt.gradle.Version
 import org.gradle.jvm.tasks.Jar
 
+buildscript {
+    dependencies {
+        @Suppress("RemoveRedundantQualifierName")
+        val atomicfuVersion = dev.svilenivanov.raftkt.gradle.Version.atomicfu
+        classpath("org.jetbrains.kotlinx:atomicfu-gradle-plugin:${atomicfuVersion}")
+    }
+}
 plugins {
     @Suppress("RemoveRedundantQualifierName")
     val kotlinVersion = dev.svilenivanov.raftkt.gradle.Version.kotlin

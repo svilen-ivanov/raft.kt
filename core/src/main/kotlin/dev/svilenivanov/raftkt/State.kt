@@ -24,8 +24,6 @@ sealed class State {
 }
 
 
-@Serializable
-data class Index(val index: Long, val term: Long)
 
 open class RaftState {
 

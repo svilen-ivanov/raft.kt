@@ -14,6 +14,7 @@ dependencies {
     api("org.slf4j:slf4j-api:${Version.slf4jApi}")
 
     testImplementation(kotlin("test"))
+    testImplementation("org.jetbrains.kotlinx:kotlinx-serialization-json:${Version.serialization}")
     testImplementation("io.kotest:kotest-assertions-core:${Version.kotest}")
     testImplementation("io.kotest:kotest-property:${Version.kotest}")
     testRuntimeOnly("org.apache.logging.log4j:log4j-slf4j-impl:${Version.log4j2}")

@@ -14,8 +14,6 @@ value class ServerAddress(private val address: String) {
 data class Configuration(
     val servers: Set<Server>
 ) {
-    fun deepClone() = copy(servers = LinkedHashSet(servers))
-
     // hasVote returns true if the server identified by 'id' is a Voter in the provided Configuration.
     fun hasVote(serverId: ServerId) = servers.find { it.serverId == serverId }?.suffrage == VOTER
 
@@ -24,28 +22,28 @@ data class Configuration(
         val idSet = HashMap<ServerId, Boolean>(servers.size)
         val addressSet = HashMap<ServerAddress, Boolean>(servers.size)
 
-        val voters = 0
+        var voters = 0
         servers.forEach { server ->
             if (server.serverId.isBlank()) {
-                throw IllegalArgumentException("empty ID in configuration: $server")
+                throw IllegalStateException("empty ID in configuration: $server")
             }
             if (server.address.isBlank()) {
-                throw IllegalArgumentException("empty address in configuration: $server")
+                throw IllegalStateException("empty address in configuration: $server")
             }
             if (idSet.containsKey(server.serverId)) {
-                throw IllegalArgumentException("found duplicate ID in configuration: $server")
+                throw IllegalStateException("found duplicate ID in configuration: $server")
             }
             idSet[server.serverId] = true
             if (addressSet.containsKey(server.address)) {
-                throw IllegalArgumentException("found duplicate address in configuration: $server")
+                throw IllegalStateException("found duplicate address in configuration: $server")
             }
             addressSet[server.address] = true
             if (server.suffrage == VOTER) {
-                voters.inc()
+                voters++
             }
         }
         if (voters == 0) {
-            throw IllegalArgumentException("need at least one voter in configuration: $this")
+            throw IllegalStateException("need at least one voter in configuration: $this")
         }
     }
 
@@ -53,7 +51,7 @@ data class Configuration(
     // split from appendConfigurationEntry so that it can be unit tested easily.
     fun next(currentIndex: Long, change: ConfigurationChangeRequest): Configuration {
         if (change.prevIndex > 0 && change.prevIndex != currentIndex) {
-            throw IllegalArgumentException("configuration changed since ${change.prevIndex} (latest is $currentIndex)")
+            throw IllegalStateException("configuration changed since ${change.prevIndex} (latest is $currentIndex)")
         }
 
         return copy(
@@ -66,11 +64,37 @@ data class Configuration(
                     // server will have a vote right away, and the Promote case below is
                     // unused.
                     val newServer = Server(VOTER, change.serverId, change.serverAddress)
-                    servers.filter { it.serverId != newServer.serverId }.toMutableSet().also { it.add(newServer) }
+                    val (found, result) = servers.fold(false to mutableSetOf<Server>()) { (prevFound, acc), it ->
+                        val currFound = it.serverId == change.serverId
+                        acc.add(
+                            if (currFound) {
+                                if (it.suffrage == VOTER) {
+                                    it.copy(address = change.serverAddress)
+                                } else {
+                                    newServer
+                                }
+                            } else it
+                        )
+                        (prevFound || currFound) to acc
+                    }
+                    result.apply { if (!found) add(newServer) }
                 }
                 ADD_NONVOTER -> {
                     val newServer = Server(NON_VOTER, change.serverId, change.serverAddress)
-                    servers.filter { it.serverId != newServer.serverId }.toMutableSet().also { it.add(newServer) }
+                    val (found, result) = servers.fold(false to mutableSetOf<Server>()) { (prevFound, acc), it ->
+                        val currFound = it.serverId == change.serverId
+                        acc.add(
+                            if (currFound) {
+                                if (it.suffrage != NON_VOTER) {
+                                    it.copy(address = change.serverAddress)
+                                } else {
+                                    newServer
+                                }
+                            } else it
+                        )
+                        (prevFound || currFound) to acc
+                    }
+                    result.apply { if (!found) add(newServer) }
                 }
                 DEMOTE_VOTER -> {
                     servers.map {
@@ -88,7 +112,7 @@ data class Configuration(
                     }.toSet()
                 }
             }
-        )
+        ).apply { check() }
     }
 }
 
@@ -149,7 +173,7 @@ data class ConfigurationChangeRequest(
     // prevIndex, if nonzero, is the index of the only configuration upon which
     // this change may be applied; if another configuration entry has been
     // added in the meantime, this request will fail.
-    val prevIndex: Long
+    val prevIndex: Long = 0
 )
 
 // configurations is state tracked on every server about its Configurations.
@@ -174,11 +198,6 @@ data class Configurations(
     val latest: Configuration,
     // latestIndex is the log index where 'latest' was written.
     val latestIndex: Long,
-) {
-    fun deepClone() = copy(
-        committed = committed.deepClone(),
-        latest = latest.deepClone(),
-    )
-}
+)
 
 

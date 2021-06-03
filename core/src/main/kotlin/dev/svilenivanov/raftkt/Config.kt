@@ -1,5 +1,6 @@
 package dev.svilenivanov.raftkt
 
+import kotlinx.serialization.Serializable
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -87,7 +88,11 @@ enum class ProtocolVersion(val version: Int) {
 
 val PROTOCOL_VERSION_MAX = ProtocolVersion.values().last()
 
-typealias ServerId = String
+@JvmInline
+@Serializable
+value class ServerId(private val id: String) {
+    fun isBlank() = id.isBlank()
+}
 
 // SnapshotVersion is the version of snapshots that this server can understand.
 // Currently, it is always assumed that the server generates the latest version,

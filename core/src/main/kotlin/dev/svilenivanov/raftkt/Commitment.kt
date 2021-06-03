@@ -1,6 +1,5 @@
 package dev.svilenivanov.raftkt
 
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.SendChannel
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -49,7 +48,7 @@ class Commitment(
     }
 
     // Internal helper to calculate new commitIndex from matchIndexes. Must be called with lock held.
-    private suspend fun recalculate() {
+    private fun recalculate() {
         if (matchIndexes.isEmpty()) return
 
         val matched = matchIndexes.values.sorted()

@@ -1,3 +1,10 @@
 package dev.svilenivanov.raftkt
 
-interface Transport
+import kotlinx.coroutines.channels.ReceiveChannel
+
+interface Transport {
+    fun setHeartbeatHandler(f: (rpc: Rpc) -> Unit)
+
+    val consumer: ReceiveChannel<Message<Rpc.Request, Rpc.Response>>
+    val localAddr: ServerAddress
+}

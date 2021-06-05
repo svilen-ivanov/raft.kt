@@ -1,96 +1,110 @@
 package dev.svilenivanov.raftkt
 
+import kotlinx.atomicfu.atomic
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.serialization.Serializable
 
-// raftState is used to maintain various state variables
-// and provides an interface to set/get the variables in a
-// thread safe manner.
+/**
+ *  RaftState captures the state of a Raft node: Follower, Candidate, Leader, or Shutdown.
+ */
+enum class State {
+    /**
+     *  Follower is the initial state of a Raft node.
+     */
+    FOLLOWER,
 
-// RaftState captures the state of a Raft node: Follower, Candidate, Leader, or Shutdown.
-sealed class State {
-    // Follower is the initial state of a Raft node.
-    object Follower : State()
+    /**
+     * Candidate is one of the valid states of a Raft node.
+     */
+    CANDIDATE,
 
-    // Candidate is one of the valid states of a Raft node.
-    object Candidate : State()
+    /**
+     *  Leader is one of the valid states of a Raft node.
+     */
+    LEADER,
 
-    // Leader is one of the valid states of a Raft node.
-    object Leader : State()
-
-    // Shutdown is the terminal state of a Raft node.
-    object Shutdown : State()
+    /**
+     *  Shutdown is the terminal state of a Raft node.
+     */
+    SHUTDOWN,
 }
 
+/**
+ * raftState is used to maintain various state variables and provides an interface to set/get the variables in a
+ * thread safe manner.
+ */
+class RaftState {
+    /**
+     * The current term, cache of StableStore
+     */
+    private val currentTerm = atomic(0L)
 
+    /**
+     * Highest committed log entry
+     */
+    private val commitIndex = atomic(0L)
 
-open class RaftState {
+    /**
+     * Last applied log to the FSM
+     */
+    private val lastApplied = atomic(0L)
 
-//    // The current term, cache of StableStore
-//    var currentTerm: Long
-//
-//    // Highest committed log entry
-//    var commitIndex: Long
-//
-//    // Last applied log to the FSM
-//    var lastApplied: Long
-//
-//    // protects 2 next fields
-//    private val lastLock = Mutex()
-//
-//    // Cache the latest snapshot index/term
-//    private var lastSnapshot: Index
-//
-//    // Cache the latest log from LogStore
-//    private var lastLog: Index
-//
-    // The current state
-    var state: State = State.Follower
-//
-//    constructor(
-//        currentTerm: Long,
-//        lastLog: Index
-//    )
-//
-//    suspend fun getLastLog(): Index {
-//        lastLock.withLock {
-//            return lastSnapshot
-//        }
-//    }
-//
-//    suspend fun setLastLog(lastLog: Index) {
-//        lastLock.withLock {
-//            this.lastLog = lastLog
-//        }
-//    }
-//
-//    suspend fun getLastSnapshot(): Index {
-//        lastLock.withLock {
-//            return lastSnapshot
-//        }
-//    }
-//
-//    suspend fun setLastSnapshot(lastLog: Index) {
-//        lastLock.withLock {
-//            this.lastLog = lastLog
-//        }
-//    }
-//
-//    suspend fun getLastIndex(): Long {
-//        lastLock.withLock {
-//            return maxOf(lastLog.index, lastSnapshot.index)
-//        }
-//    }
-//
-//    suspend fun getLastEntry(): Index {
-//        lastLock.withLock {
-//            return if (lastLog.index >= lastSnapshot.index) {
-//                this.lastLog
-//            } else {
-//                this.lastSnapshot
-//            }
-//        }
-//    }
+    // Cache the latest snapshot index/term
+    // protects 4 next fields
+    private val lastLock = Mutex()
+    private var lastSnapshot: Position = ZERO_POSITION
+    private var lastLog: Position = ZERO_POSITION
+
+    companion object {
+        val ZERO_POSITION = Position(0, 0)
+    }
+
+    /**
+     * The current state
+     */
+    private val state = atomic(State.FOLLOWER)
+
+    fun getState() = state.value
+    fun setState(newState: State) {
+        state.value = newState
+    }
+
+    fun getCurrentTerm() = currentTerm.value
+    fun setCurrentTerm(newTerm: Long) {
+        currentTerm.value = newTerm
+    }
+
+    suspend fun getLastLog() = lastLock.withLock { lastLog }
+    suspend fun setLastLog(newLastLog: Position) = lastLock.withLock { lastLog = newLastLog }
+
+    suspend fun getLastSnapshot() = lastLock.withLock { lastSnapshot }
+    suspend fun setLastSnapshot(newLastSnapshot: Position) = lastLock.withLock { lastSnapshot = newLastSnapshot }
+
+    fun getCommitIndex() = commitIndex.value
+    fun setCommitIndex(newCommitIndex: Long) {
+        commitIndex.value = newCommitIndex
+    }
+
+    fun getLastApplied() = lastApplied.value
+    fun setLastApplied(newLastApplied: Long) {
+        lastApplied.value = newLastApplied
+    }
+
+    /**
+     * getLastIndex returns the last index in stable storage. Either from the last log or from the last snapshot.
+     */
+    suspend fun getLastIndex() = lastLock.withLock { maxOf(lastLog.index, lastSnapshot.index) }
+
+    /**
+     * getLastEntry returns the last index and term in stable storage. Either from the last log or from the last
+     * snapshot.
+     */
+    suspend fun getLastEntryIndex() = lastLock.withLock {
+        if (lastLog.index >= lastSnapshot.index) {
+            lastLog
+        } else {
+            lastSnapshot
+        }
+    }
 }
 

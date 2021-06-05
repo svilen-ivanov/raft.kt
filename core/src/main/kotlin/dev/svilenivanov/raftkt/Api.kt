@@ -1,11 +1,25 @@
+@file:Suppress("UNUSED_PARAMETER")
+
 package dev.svilenivanov.raftkt
 
+import dev.svilenivanov.raftkt.Observation.*
+import dev.svilenivanov.raftkt.State.*
+import kotlinx.atomicfu.atomic
+import kotlinx.atomicfu.getAndUpdate
+import kotlinx.atomicfu.update
+import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.isActive
+import kotlinx.coroutines.channels.ReceiveChannel
+import kotlinx.coroutines.channels.SendChannel
+import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.datetime.Clock
+import kotlinx.datetime.Instant
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
-import kotlin.coroutines.cancellation.CancellationException
 import kotlin.coroutines.coroutineContext
+import kotlin.random.Random
+import kotlin.time.Duration
 
 // This is the current suggested max size of the data in a raft log entry.
 // This is based on current architecture, default timing, etc. Clients can
@@ -18,7 +32,7 @@ import kotlin.coroutines.coroutineContext
 // potentially causing leadership instability.
 const val SuggestedMaxDataSize = 512 * 1024
 
-sealed class Error(val message: String) {
+sealed class Error(message: String) : Throwable(message) {
 
     object ErrNotLeader : Error("node is not the leader")
     object ErrLeadershipLost : Error("leadership lost while committing log")
@@ -31,63 +45,267 @@ sealed class Error(val message: String) {
     object ErrLeadershipTransferInProgress : Error("leadership transfer in progress")
 }
 
-class Raft<T, E> private constructor(
-    private val config: Config,
-    private val fsm: Fsm,
-    private val logs: LogStore<T, E>,
+class Raft<T, E, R> private constructor(
+    config: Config,
+    // FSM is the client state machine to apply commands to
+    private val fsm: Fsm<T, E, R>,
+    // LogStore provides durable storage for logs
+    private val logs: LogStore,
+    // stable is a StableStore implementation for durable state
+    // It provides stable storage for many fields in raftState
     private val stable: StableStore,
-    private val snaps: SnapshotStore,
-    private val transport: Transport
-
+    // snapshots is used to store and retrieve snapshots
+    private val snapshots: SnapshotStore,
+    // The transport layer we use
+    private val transport: Transport,
+    // clock
+    private val clock: Clock = Clock.System
 ) {
     companion object {
         @JvmStatic
         private val logger: Logger = LoggerFactory.getLogger(Raft::class.java)
 
-        suspend fun <T, E> create(
+        suspend fun <T, E, R> create(
             config: Config,
-            fsm: Fsm,
-            logs: LogStore<T, E>,
+            fsm: Fsm<T, E, R>,
+            logs: LogStore,
             stable: StableStore,
             snaps: SnapshotStore,
             transport: Transport
-        ): Raft<T, E> {
+        ): Raft<T, E, R> {
             return Raft(config, fsm, logs, stable, snaps, transport).apply { init() }
         }
     }
 
-    private lateinit var raftState: RaftState
-    private lateinit var applyCh: Channel<Unit>
+    // protocolVersion is used to inter-operate with Raft servers running
+    // different versions of the library. See comments in config.go for more
+    // details.
+    private lateinit var protocolVersion: ProtocolVersion;
+
+    // applyCh is used to async send logs to the main thread to
+    // be committed and applied to the FSM.
+    private lateinit var applyCh: Channel<Message<Log, R>>
+
+    // conf stores the current configuration to use. This is the most recent one
+    // provided. All reads of config values should use the config() helper method
+    // to read this safely.
+    private val config = atomic(config)
+
+    // confReloadMu ensures that only one thread can reload config at once since
+    // we need to read-modify-write the atomic. It is NOT necessary to hold this
+    // for any other operation e.g. reading config using config().
+    private val confReloadMu = Mutex()
+
+    // fsmMutateCh is used to send state-changing updates to the FSM. This
+    // receives pointers to commitTuple structures when applying logs or
+    // pointers to restoreFuture structures when restoring a snapshot. We
+    // need control over the order of these operations when doing user
+    // restores so that we finish applying any old log applies before we
+    // take a user snapshot on the leader, otherwise we might restore the
+    // snapshot and apply old logs to it that were in the pipe.
+    private lateinit var fsmMutateCh: Channel<Any>
+
+    // fsmSnapshotCh is used to trigger a new snapshot being taken
+    private lateinit var fsmSnapshotCh: Channel<Any>
+
+    // lastContact is the last time we had contact from the
+    // leader node. This can be used to gauge staleness.
+    private val lastContact = atomic(Instant.DISTANT_PAST)
+
+    // Leader is the current cluster leader
+    private val leader = atomic<ServerAddress?>(null)
+
+    // leaderCh is used to notify of leadership changes
+    private lateinit var leaderCh: Channel<Boolean>
+
+    // leaderState used only while state is leader
+    private lateinit var leaderState: LeaderState
+
+    // candidateFromLeadershipTransfer is used to indicate that this server became
+    // candidate because the leader tries to transfer leadership. This flag is
+    // used in RequestVoteRequest to express that a leadership transfer is going
+    // on.
+    private var candidateFromLeadershipTransfer = false
+
+    // Stores our local server ID, used to avoid sending RPCs to ourself
+    private val localId: ServerId get() = config.value.localId
+
+    // Stores our local addr
+    private val localAddr: ServerAddress get() = transport.localAddr
+
+    // Used to request the leader to make configuration changes.
+    private lateinit var configurationChangeCh: Channel<Message<Configuration, Unit>>
+
+    // Tracks the latest configuration and latest committed configuration from
+    // the log/snapshot.
+    private val configurations = atomic(Configurations.NONE)
+
+    // Holds a copy of the latest configuration which can be read
+    // independently from main loop.
+    private val latestConfiguration = atomic<Configuration?>(null)
+
+    // Holds a copy of the latest configuration which can be read
+    // independently from main loop.
+    private lateinit var rpcCh: ReceiveChannel<Message<Rpc.Request, Rpc.Response>>
+
+    // Shutdown channel to exit, protected to prevent concurrent exits
+    private var shutdown: Boolean = false
+    private val shutdownMutex = Mutex()
+
+    // userSnapshotCh is used for user-triggered snapshots
+    private lateinit var userSnapshotCh: Channel<Any>
+
+    // userRestoreCh is used for user-triggered restores of external snapshots
+    private lateinit var userRestoreCh: Channel<Message<Any, Any>>
+
+    // verifyCh is used to async send verify futures to the main thread
+    // to verify we are still the leader
+    private lateinit var verifyCh: Channel<Message<Any, Any>>
+
+    // configurationsCh is used to get the configuration data safely from
+    // outside of the main thread.
+    private lateinit var configurationsCh: Channel<Message<Unit, Configurations>>
+
+    // bootstrapCh is used to attempt an initial bootstrap from outside of the main thread.
+    private lateinit var bootstrapCh: Channel<Message<Configuration, Unit>>
+
+    // List of observers and the mutex that protects them. The observers list
+    // is indexed by an artificial ID which is used for deregistration.
+//    private val observersLock = Mutex()
+    private val observers = Observers()
+
+    // leadershipTransferCh is used to start a leadership transfer from outside of
+    // the main thread.
+    private lateinit var leadershipTransferCh: Channel<Message<Any, Any>>
+
+    private val raftState = RaftState()
     private lateinit var rpc: Channel<Rpc>
+    private lateinit var groupJob: Job
 
     @Suppress("UNUSED_VARIABLE")
     suspend fun init() {
-        val currentTerm = stable.get("currentTerm".toByteArray()) ?: throw IllegalStateException("failed to load current term")
+        val currentTerm = stable.getLong(Key.CURRENT_TERM) ?: 0
+        val lastIndex = logs.lastIndex()
+        val lastLog = lastIndex?.run {
+            if (lastIndex > 0) {
+                logs.getLog(lastIndex)?.position
+                    ?: throw IllegalStateException("failed to get last log at index $lastIndex")
+            } else {
+                null
+            }
+        } ?: RaftState.ZERO_POSITION
 
-        val lastIndex = logs.lastIndex() ?: throw IllegalStateException("failed to find last log")
-        val lastLog = if (lastIndex > 0) {
-            logs.getLog(lastIndex) ?: throw IllegalStateException("failed to get last log at index $lastIndex")
-        } else {
-            null
+        // Buffer applyCh to MaxAppendEntries if the option is enabled
+        applyCh = Channel(if (config.value.batchApplyCh) config.value.maxAppendEntries else Channel.RENDEZVOUS)
+        // Create Raft struct.
+        protocolVersion = config.value.protocolVersion
+        fsmMutateCh = Channel(128)
+        fsmSnapshotCh = Channel()
+        leaderCh = Channel(1)
+        configurationChangeCh = Channel()
+        rpcCh = transport.consumer
+        userSnapshotCh = Channel()
+        userRestoreCh = Channel()
+        verifyCh = Channel(64)
+        configurationsCh = Channel(8)
+        bootstrapCh = Channel()
+        leadershipTransferCh = Channel(1)
+
+        raftState.apply {
+            // Initialize as a follower.
+            setState(FOLLOWER)
+            // Restore the current term and the last log.
+            setCurrentTerm(currentTerm)
+            setLastLog(lastLog)
         }
 
-        applyCh = Channel(if (config.batchApplyCh) config.maxAppendEntries else Channel.RENDEZVOUS)
+        // Attempt to restore a snapshot if there are any.
+        restoreSnapshot()
+        val snapshotIndex = raftState.getLastSnapshot().index
+        for (index in (snapshotIndex + 1).rangeTo(lastLog.index)) {
+            val entry = logs.getLog(index) ?: throw IllegalStateException("failed to get log index=$index")
+            processConfigLogEntry(entry)
+        }
+        logger.info(
+            "initial configuration index={}, servers={}",
+            configurations.value.latestIndex,
+            configurations.value.latest
+        )
+        // Setup a heartbeat fast-path to avoid head-of-line
+        // blocking where possible. It MUST be safe for this
+        // to be called concurrently with a blocking RPC.
+        transport.setHeartbeatHandler(this::processHeartbeat)
+        if (config.value.skipStartup) return
 
+        groupJob = supervisorScope {
+            launch { run() }
+            launch { runFsm() }
+            launch { runSnapshots() }
+        }
+    }
 
-//        raftState = RaftState(
-//            currentTerm,
-//            lastLog
-//        )
+    private fun runSnapshots() {
+        TODO("Not yet implemented")
+    }
+
+    private fun runFsm() {
+        TODO("Not yet implemented")
+    }
+
+    private fun processConfigLogEntry(entry: Log) {
+        if (entry is Log.Configuration) {
+            configurations.update {
+                Configurations(
+                    committed = it.latest,
+                    committedIndex = it.latestIndex,
+                    latest = entry.configuration,
+                    latestIndex = entry.position.index
+                )
+            }
+        }
+    }
+
+    private suspend fun restoreSnapshot() {
+        val snapshot = snapshots.list().firstOrNull()
+            ?: throw IllegalStateException("failed to load any existing snapshots")
+        if (!config.value.noSnapshotRestoreOnStart) {
+            val source = snapshots.open(snapshot.id)
+            fsm.restore(source)
+            logger.info("Restored from snapshot {}", source.meta.id)
+        }
+        raftState.setLastApplied(snapshot.position.index)
+        raftState.setLastSnapshot(snapshot.position)
+        configurations.value = Configurations(
+            snapshot.configuration, snapshot.configurationIndex,
+            snapshot.configuration, snapshot.configurationIndex
+        )
+    }
+
+    private fun setCommittedConfiguration(configuration: Configuration, configurationIndex: Long) {
+        configurations.update {
+            it.copy(committed = configuration, committedIndex = configurationIndex)
+        }
+    }
+
+    private fun setLatestConfiguration(configuration: Configuration, configurationIndex: Long) {
+        configurations.update {
+            it.copy(latest = configuration, latestIndex = configurationIndex)
+        }
+    }
+
+    private fun processHeartbeat(rpc: Rpc) {
+        TODO("Not yet implemented")
     }
 
     private suspend fun run() {
         while (coroutineContext.isActive) {
-            return when (raftState.state) {
-                State.Follower -> runFollower()
-                State.Candidate -> runCandidate()
-                State.Leader -> runLeader()
-                State.Shutdown -> {
-                    // exit
+            return when (raftState.getState()) {
+                FOLLOWER -> runFollower()
+                CANDIDATE -> runCandidate()
+                LEADER -> runLeader()
+                SHUTDOWN -> {
+                    setLeader(null)
+                    break
                 }
             }
         }
@@ -98,11 +316,109 @@ class Raft<T, E> private constructor(
     }
 
     private suspend fun runCandidate() {
-        TODO("Not yet implemented")
+        logger.info("entering candidate state: node={}, term={}", this, raftState.getCurrentTerm() + 1)
     }
 
     private suspend fun runFollower() {
+        logger.info("entering follower state: follower={}, leader={}", this, this.leader.value)
+        coroutineScope {
+            val heartbeatTimer = Channel<Unit>()
+            randomTimeout(heartbeatTimer, config.value.heartbeatTimeout)
+            while (isActive && raftState.getState() == FOLLOWER) {
+                select<Unit> {
+                    rpcCh.onReceive { processRpc(it) }
+                    configurationChangeCh.onReceive(::respondNotLeader)
+                    applyCh.onReceive(::respondNotLeader)
+                    verifyCh.onReceive(::respondNotLeader)
+                    userRestoreCh.onReceive(::respondNotLeader)
+                    leadershipTransferCh.onReceive(::respondNotLeader)
+                    configurationsCh.onReceive { it.respond { configurations.value } }
+                    bootstrapCh.onReceive { it.respond { liveBootstrap(it.request) } }
+                    heartbeatTimer.onReceive {
+                        val hbTimeout = config.value.heartbeatTimeout
+                        randomTimeout(heartbeatTimer, hbTimeout)
+                        if (clock.now().minus(lastContact.value) >= hbTimeout) {
+                            val lastLeader = setLeader(null)
+                            val configurations = configurations.value
+                            if (configurations.latestIndex == 0L) {
+                                logger.warn("no known peers, aborting election")
+                            } else if (configurations.latestIndex == configurations.committedIndex
+                                && !configurations.latest.hasVote(localId)
+                            ) {
+                                logger.warn("not part of stable configuration, aborting election")
+                            } else {
+                                logger.warn("heartbeat timeout reached, starting election, last-leader={}", lastLeader)
+                                raftState.setState(CANDIDATE)
+                                cancel("heartbeat timeout reached, starting election")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun setLeader(newLeader: ServerAddress?): ServerAddress? {
+        val oldLeader = leader.getAndUpdate {
+            newLeader
+        }
+        if (oldLeader != newLeader) {
+            observers.observe(LeaderObservation(newLeader))
+        }
+        return oldLeader
+    }
+
+    private fun CoroutineScope.randomTimeout(channel: SendChannel<Unit>, heartbeatTimeout: Duration) {
+        launch {
+            delay(
+                heartbeatTimeout.inWholeMilliseconds
+                        + Random.nextLong(heartbeatTimeout.inWholeMilliseconds)
+            )
+            channel.send(Unit)
+        }
+    }
+
+    private fun liveBootstrap(request: Configuration) {
         TODO("Not yet implemented")
+    }
+
+    private suspend fun processRpc(message: Message<Rpc.Request, Rpc.Response>) {
+        return message.respond {
+            checkRpcHeader(message.request.header)
+            when (message.request) {
+                is Rpc.AppendEntriesRequest -> appendEntries(message.request)
+                is Rpc.InstallSnapshotRequest -> installSnapshot(message.request)
+                is Rpc.RequestVoteRequest -> requestVote(message.request)
+                is Rpc.TimeoutNowRequest -> timeoutNow(message.request)
+            }
+        }
+    }
+
+    private suspend fun timeoutNow(request: Rpc.TimeoutNowRequest): Rpc.TimeoutNowResponse {
+        TODO("Not yet implemented")
+    }
+
+    private suspend fun requestVote(request: Rpc.RequestVoteRequest): Rpc.RequestVoteResponse {
+        TODO("Not yet implemented")
+
+    }
+
+    private suspend fun installSnapshot(request: Rpc.InstallSnapshotRequest): Rpc.InstallSnapshotResponse {
+        TODO("Not yet implemented")
+    }
+
+    private suspend fun appendEntries(req: Rpc.AppendEntriesRequest): Rpc.AppendEntriesResponse {
+        TODO("Not yet implemented")
+    }
+
+    private fun checkRpcHeader(header: RpcHeader) {
+        if (header.protocolVersion != ProtocolVersion.VERSION_3) {
+            throw Error.ErrUnsupportedProtocol
+        }
+    }
+
+    private fun respondNotLeader(message: Message<*, *>) {
+        message.response.completeExceptionally(Error.ErrNotLeader)
     }
 }
 

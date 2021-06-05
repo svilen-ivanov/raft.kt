@@ -5,11 +5,11 @@ import dev.svilenivanov.raftkt.LogStore
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
-class InmemLogStore<T, E> : LogStore<T, E> {
+class InmemLogStore : LogStore {
     private val lock = Mutex()
     private var lowIndex: Long? = null
     private var highIndex: Long? = null
-    private val logs = mutableMapOf<Long, Log<T, E>>()
+    private val logs = mutableMapOf<Long, Log>()
 
     override suspend fun firstIndex() = lock.withLock {
         lowIndex
@@ -19,17 +19,17 @@ class InmemLogStore<T, E> : LogStore<T, E> {
         highIndex
     }
 
-    override suspend fun getLog(index: Long): Log<T, E>? = lock.withLock {
+    override suspend fun getLog(index: Long): Log? = lock.withLock {
         logs[index]
     }
 
-    override suspend fun storeLog(log: Log<T, E>) = storeLogs(sequenceOf(log))
+    override suspend fun storeLog(log: Log) = storeLogs(sequenceOf(log))
 
-    override suspend fun storeLogs(entries: Sequence<Log<T, E>>) = lock.withLock {
+    override suspend fun storeLogs(entries: Sequence<Log>) = lock.withLock {
         entries.forEach { l ->
-            logs[l.index] = l
-            if (lowIndex == null) lowIndex = l.index
-            if (highIndex == null || l.index > highIndex!!) highIndex = l.index
+            logs[l.position.index] = l
+            if (lowIndex == null) lowIndex = l.position.index
+            if (highIndex == null || l.position.index > highIndex!!) highIndex = l.position.index
         }
     }
 

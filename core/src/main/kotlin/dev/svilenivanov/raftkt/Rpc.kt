@@ -10,8 +10,11 @@ interface RpcHeaderProp {
 }
 
 sealed class Rpc : RpcHeaderProp {
+    sealed class Request: Rpc()
+    sealed class Response: Rpc()
+
     @Serializable
-    data class AppendEntriesRequest<T, E>(
+    data class AppendEntriesRequest(
         override val header: RpcHeader,
 
         // Provide the current term and leader
@@ -21,10 +24,10 @@ sealed class Rpc : RpcHeaderProp {
         val prevLogEntry: Long,
         val prevLogTerm: Long,
         // New entries to commit
-        val entries: Iterable<Log<T, E>>,
+        val entries: Iterable<Log>,
         // Commit index on the leader
         val leaderCommitIndex: Long
-    ) : Rpc()
+    ) : Rpc.Request()
 
     @Serializable
     data class AppendEntriesResponse(
@@ -39,7 +42,7 @@ sealed class Rpc : RpcHeaderProp {
         // There are scenarios where this request didn't succeed
         // but there's no need to wait/back-off the next attempt.
         val noRetryBackoff: Boolean
-    ) : Rpc()
+    ) : Rpc.Response()
 
     @Serializable
     data class RequestVoteRequest(
@@ -57,7 +60,7 @@ sealed class Rpc : RpcHeaderProp {
         // transfer. It is required for leadership transfer to work, because servers
         // wouldn't vote otherwise if they are aware of an existing leader.
         val leadershipTransfer: Boolean
-    ) : Rpc()
+    ) : Rpc.Request()
 
     @Serializable
     data class RequestVoteResponse(
@@ -67,7 +70,7 @@ sealed class Rpc : RpcHeaderProp {
         val term: Long,
         // Is the vote granted.
         val granted: Boolean
-    ) : Rpc()
+    ) : Rpc.Response()
 
     @Serializable
     data class InstallSnapshotRequest(
@@ -88,7 +91,7 @@ sealed class Rpc : RpcHeaderProp {
 
         // Size of the snapshot
         val size: Long,
-    ) : Rpc()
+    ) : Rpc.Request()
 
     @Serializable
     data class InstallSnapshotResponse(
@@ -96,15 +99,15 @@ sealed class Rpc : RpcHeaderProp {
 
         val term: Long,
         val success: Boolean,
-    ) : Rpc()
+    ) : Rpc.Response()
 
     @Serializable
     data class TimeoutNowRequest(
         override val header: RpcHeader,
-    ) : Rpc()
+    ) : Rpc.Request()
 
     @Serializable
     data class TimeoutNowResponse(
         override val header: RpcHeader,
-    ) : Rpc()
+    ) : Rpc.Response()
 }

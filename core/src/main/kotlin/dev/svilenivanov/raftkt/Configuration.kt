@@ -114,6 +114,10 @@ data class Configuration(
             }
         ).apply { check() }
     }
+
+    companion object {
+        val NONE = Configuration(emptySet())
+    }
 }
 
 @Serializable
@@ -198,6 +202,15 @@ data class Configurations(
     val latest: Configuration,
     // latestIndex is the log index where 'latest' was written.
     val latestIndex: Long,
-)
+) {
+    companion object {
+        val NONE = Configurations(
+            Configuration.NONE,
+            0,
+            Configuration.NONE,
+            0
+        )
+    }
+}
 
 

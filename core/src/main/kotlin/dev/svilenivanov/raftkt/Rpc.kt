@@ -19,12 +19,12 @@ sealed class Rpc : RpcHeaderProp {
 
         // Provide the current term and leader
         val term: Long,
-        val leader: ServerId,
+        val leader: Peer,
         // Provide the previous entries for integrity checking
         val prevLogEntry: Long,
         val prevLogTerm: Long,
         // New entries to commit
-        val entries: Iterable<Log>,
+        val entries: List<Log>,
         // Commit index on the leader
         val leaderCommitIndex: Long
     ) : Rpc.Request()

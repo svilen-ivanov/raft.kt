@@ -99,7 +99,7 @@ class RaftState {
      * getLastEntry returns the last index and term in stable storage. Either from the last log or from the last
      * snapshot.
      */
-    suspend fun getLastEntryIndex() = lastLock.withLock {
+    suspend fun getLastEntry() = lastLock.withLock {
         if (lastLog.index >= lastSnapshot.index) {
             lastLog
         } else {

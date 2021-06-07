@@ -2,7 +2,7 @@
 
 package dev.svilenivanov.raftkt
 
-import dev.svilenivanov.raftkt.Observation.*
+import dev.svilenivanov.raftkt.Observation.LeaderObservation
 import dev.svilenivanov.raftkt.State.*
 import kotlinx.atomicfu.atomic
 import kotlinx.atomicfu.getAndUpdate
@@ -43,6 +43,7 @@ sealed class Error(message: String) : Throwable(message) {
     object ErrUnsupportedProtocol : Error("operation not supported with current protocol version")
     object ErrCantBootstrap : Error("bootstrap only works on new clusters")
     object ErrLeadershipTransferInProgress : Error("leadership transfer in progress")
+    class ErrUnexpectedRequest(request: Rpc.Request) : Error("expected heartbeat, got ${request::class}")
 }
 
 class Raft<T, E, R> private constructor(
@@ -103,7 +104,7 @@ class Raft<T, E, R> private constructor(
     // restores so that we finish applying any old log applies before we
     // take a user snapshot on the leader, otherwise we might restore the
     // snapshot and apply old logs to it that were in the pipe.
-    private lateinit var fsmMutateCh: Channel<Any>
+    private lateinit var fsmMutateCh: Channel<Sequence<Message<Log, R?>>>
 
     // fsmSnapshotCh is used to trigger a new snapshot being taken
     private lateinit var fsmSnapshotCh: Channel<Any>
@@ -138,7 +139,7 @@ class Raft<T, E, R> private constructor(
 
     // Tracks the latest configuration and latest committed configuration from
     // the log/snapshot.
-    private val configurations = atomic(Configurations.NONE)
+    private var configurations = Configurations.NONE
 
     // Holds a copy of the latest configuration which can be read
     // independently from main loop.
@@ -228,8 +229,8 @@ class Raft<T, E, R> private constructor(
         }
         logger.info(
             "initial configuration index={}, servers={}",
-            configurations.value.latestIndex,
-            configurations.value.latest
+            configurations.latestIndex,
+            configurations.latest
         )
         // Setup a heartbeat fast-path to avoid head-of-line
         // blocking where possible. It MUST be safe for this
@@ -254,14 +255,14 @@ class Raft<T, E, R> private constructor(
 
     private fun processConfigLogEntry(entry: Log) {
         if (entry is Log.Configuration) {
-            configurations.update {
+            configurations =
                 Configurations(
-                    committed = it.latest,
-                    committedIndex = it.latestIndex,
+                    committed = configurations.latest,
+                    committedIndex = configurations.latestIndex,
                     latest = entry.configuration,
                     latestIndex = entry.position.index
                 )
-            }
+
         }
     }
 
@@ -275,26 +276,20 @@ class Raft<T, E, R> private constructor(
         }
         raftState.setLastApplied(snapshot.position.index)
         raftState.setLastSnapshot(snapshot.position)
-        configurations.value = Configurations(
+        configurations = Configurations(
             snapshot.configuration, snapshot.configurationIndex,
             snapshot.configuration, snapshot.configurationIndex
         )
+        latestConfiguration.value = snapshot.configuration
     }
 
     private fun setCommittedConfiguration(configuration: Configuration, configurationIndex: Long) {
-        configurations.update {
-            it.copy(committed = configuration, committedIndex = configurationIndex)
-        }
+        configurations = configurations.copy(committed = configuration, committedIndex = configurationIndex)
     }
 
     private fun setLatestConfiguration(configuration: Configuration, configurationIndex: Long) {
-        configurations.update {
-            it.copy(latest = configuration, latestIndex = configurationIndex)
-        }
-    }
-
-    private fun processHeartbeat(rpc: Rpc) {
-        TODO("Not yet implemented")
+        configurations = configurations.copy(latest = configuration, latestIndex = configurationIndex)
+        latestConfiguration.value = configuration
     }
 
     private suspend fun run() {
@@ -332,14 +327,13 @@ class Raft<T, E, R> private constructor(
                     verifyCh.onReceive(::respondNotLeader)
                     userRestoreCh.onReceive(::respondNotLeader)
                     leadershipTransferCh.onReceive(::respondNotLeader)
-                    configurationsCh.onReceive { it.respond { configurations.value } }
+                    configurationsCh.onReceive { it.respond { configurations } }
                     bootstrapCh.onReceive { it.respond { liveBootstrap(it.request) } }
                     heartbeatTimer.onReceive {
                         val hbTimeout = config.value.heartbeatTimeout
                         randomTimeout(heartbeatTimer, hbTimeout)
                         if (clock.now().minus(lastContact.value) >= hbTimeout) {
                             val lastLeader = setLeader(null)
-                            val configurations = configurations.value
                             if (configurations.latestIndex == 0L) {
                                 logger.warn("no known peers, aborting election")
                             } else if (configurations.latestIndex == configurations.committedIndex
@@ -394,6 +388,20 @@ class Raft<T, E, R> private constructor(
         }
     }
 
+    // processHeartbeat is a special handler used just for heartbeat requests
+    // so that they can be fast-pathed if a transport supports it. This must only
+    // be called from the main thread.
+    private suspend fun processHeartbeat(message: Message<Rpc.Request, Rpc.Response>) {
+        return message.respond {
+            checkRpcHeader(message.request.header)
+            when (message.request) {
+                is Rpc.AppendEntriesRequest -> appendEntries(message.request)
+                else -> throw Error.ErrUnexpectedRequest(message.request)
+            }
+        }
+    }
+
+
     private suspend fun timeoutNow(request: Rpc.TimeoutNowRequest): Rpc.TimeoutNowResponse {
         TODO("Not yet implemented")
     }
@@ -408,7 +416,182 @@ class Raft<T, E, R> private constructor(
     }
 
     private suspend fun appendEntries(req: Rpc.AppendEntriesRequest): Rpc.AppendEntriesResponse {
-        TODO("Not yet implemented")
+        var resp = Rpc.AppendEntriesResponse(
+            header = req.header,
+            term = raftState.getCurrentTerm(),
+            lastLog = raftState.getLastIndex(),
+            success = false,
+            noRetryBackoff = false
+        )
+
+        // Ignore an older term
+        if (req.term < raftState.getCurrentTerm()) {
+            return resp
+        }
+        // Increase the term if we see a newer one, also transition to follower
+        // if we ever get an appendEntries call
+        if (req.term > raftState.getCurrentTerm() || raftState.getState() != FOLLOWER) {
+            raftState.setState(FOLLOWER)
+            raftState.setCurrentTerm(req.term)
+            resp = resp.copy(term = req.term)
+        }
+
+        // Save the current leader
+        setLeader(req.leader.address)
+
+        // Verify the last log entry
+        if (req.prevLogEntry > 0) {
+            val (lastIdx, lastTerm) = raftState.getLastEntry()
+            val prevLogTerm = if (req.prevLogEntry == lastIdx) {
+                lastTerm
+            } else {
+                val (prevLog, exception) = try {
+                    Pair(logs.getLog(req.prevLogEntry), null)
+                } catch (e: Exception) {
+                    Pair(null, e)
+                }
+                if (prevLog == null || exception != null) {
+                    logger.warn(
+                        "failed to get previous log, previous-index={}, last-index={}, exception={}",
+                        req.prevLogEntry,
+                        lastIdx,
+                        exception
+                    )
+                    return resp.copy(noRetryBackoff = true)
+                }
+                prevLog.position.term
+            }
+            if (req.prevLogTerm != prevLogTerm) {
+                logger.warn("previous log term mis-match, ours={}, remote={}", prevLogTerm, req.prevLogTerm)
+                return resp.copy(noRetryBackoff = true)
+            }
+        }
+
+        // Process any new entries
+        if (req.entries.isNotEmpty()) {
+            val lastLogIdx = raftState.getLastLog().index
+            var newEntries = emptyList<Log>()
+            for ((i, entry) in req.entries.withIndex()) {
+                if (entry.position.index > lastLogIdx) {
+                    newEntries = req.entries.subList(i, req.entries.size)
+                    break
+                }
+                val (storeEntry, exception) = try {
+                    Pair(logs.getLog(entry.position.index), null)
+                } catch (e: Exception) {
+                    Pair(null, e)
+                }
+                if (storeEntry == null || exception != null) {
+                    logger.warn(
+                        "failed to get log entry, index={}, exception={}",
+                        entry.position.index,
+                        exception
+                    )
+                    return resp
+                }
+                if (entry.position.term != storeEntry.position.term) {
+                    logger.warn("clearing log suffix, from={}, to={}", entry.position.index, lastLogIdx)
+                    try {
+                        logs.deleteRange(entry.position.index..lastLogIdx)
+                    } catch (e: Exception) {
+                        logger.error("failed to clear log suffix", e)
+                        return resp
+                    }
+                    if (entry.position.index < configurations.latestIndex) {
+                        setLatestConfiguration(configurations.committed, configurations.committedIndex)
+                    }
+                    newEntries = req.entries.subList(i, req.entries.size)
+                    break
+                }
+            }
+
+            if (newEntries.isNotEmpty()) {
+                try {
+                    logs.storeLogs(newEntries.asSequence())
+                } catch (e: Exception) {
+                    logger.error("failed to append to logs", e)
+                    return resp
+                }
+                newEntries.forEach(::processConfigLogEntry)
+                val last = newEntries.last()
+                raftState.setLastLog(last.position)
+            }
+        }
+
+        // Update the commit index
+        if (req.leaderCommitIndex > 0 && req.leaderCommitIndex > raftState.getCommitIndex()) {
+            val idx = minOf(req.leaderCommitIndex, raftState.getLastIndex())
+            raftState.setCommitIndex(idx)
+            if (configurations.latestIndex <= idx) {
+                setCommittedConfiguration(configurations.latest, configurations.latestIndex)
+            }
+            processLogs(idx, emptyMap())
+        }
+
+        setLastContact()
+        return Rpc.AppendEntriesResponse(
+            header = req.header,
+            term = req.term,
+            lastLog = raftState.getLastIndex(),
+            success = true,
+            noRetryBackoff = false
+        )
+    }
+
+    /**
+     * processLogs is used to apply all the committed entries that haven't been applied up to the given index limit.
+     * This can be called from both leaders and followers. Followers call this from AppendEntries, for n entries at a
+     * time, and always pass [futures]=nil. Leaders call this when entries are committed. They pass the futures from any
+     * inflight logs.
+     */
+    private suspend fun processLogs(index: Long, futures: Map<Long, Message<Log, R?>>) {
+        val lastApplied = raftState.getLastApplied()
+        if (index <= lastApplied) {
+            logger.warn("skipping application of old log: index={}", index)
+            return
+        }
+        // Store maxAppendEntries for this call in case it ever becomes reloadable. We need to use the same value for
+        // all lines here to get the expected result.
+        val maxAppendEntries = config.value.maxAppendEntries
+
+        val batch = mutableListOf<Message<Log, R?>>()
+        for (idx in (lastApplied + 1)..index) {
+            val future = futures[idx]
+            val preparedLog = if (future == null) {
+                val log = logs.getLog(idx) ?: throw IllegalStateException("failed to get log, index=${idx}")
+                Message(log)
+            } else {
+                if (future.request is Log.Nop) {
+                    future.response.complete(null)
+                    continue
+                }
+                future
+            }
+            // If we have a log ready to send to the FSM add it to the batch.
+            // The FSM thread will respond to the future.
+            batch.add(preparedLog)
+            if (batch.size >= maxAppendEntries) {
+                // If we have filled up a batch, send it to the FSM
+                applyBatch(batch)
+                batch.clear()
+            }
+        }
+        // If there are any remaining logs in the batch apply them
+        if (batch.size > 0) applyBatch(batch)
+        raftState.setLastApplied(index)
+    }
+
+    private suspend fun applyBatch(batch: List<Message<Log, R?>>) {
+        try {
+            fsmMutateCh.send(batch.asSequence())
+        } catch (e: CancellationException) {
+            batch.forEach { message -> message.response.completeExceptionally(Error.ErrRaftShutdown) }
+            throw e
+        }
+    }
+
+    private fun setLastContact() {
+        lastContact.update { clock.now() }
     }
 
     private fun checkRpcHeader(header: RpcHeader) {

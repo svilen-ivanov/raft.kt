@@ -46,7 +46,7 @@ internal class ConfigurationTest {
         val next: Configuration
     )
 
-    private val emptyConfiguration = Configuration(emptySet())
+    private val emptyConfiguration = Configuration.NONE
     private val nextConfigurationTests = listOf(
         // 1
         NextConfigurationTest(

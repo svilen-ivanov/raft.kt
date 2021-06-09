@@ -10,38 +10,30 @@ data class Position constructor(
     val term: Long,
 )
 
-interface LogProp {
-    val position: Position
-    val appendedAt: Instant
-}
-
 @Serializable
-sealed class Log : LogProp {
+data class Log(
+    val position: Position,
+    val appendedAt: Instant,
+    val data: Data
+) {
     @Serializable
-    data class Command<T>(
-        override val position: Position,
-        override val appendedAt: Instant,
-        val data: T,
-    ) : Log()
+    sealed class Data {
+        @Serializable
+        data class Command<T>(
+            val data: T,
+        ) : Data()
 
-    @Serializable
-    data class Nop(
-        override val position: Position,
-        override val appendedAt: Instant
-    ) : Log()
+        @Serializable
+        object Nop : Data()
 
-    @Serializable
-    data class Barrier(
-        override val position: Position,
-        override val appendedAt: Instant
-    ) : Log()
+        @Serializable
+        object Barrie : Data()
 
-    @Serializable
-    data class Configuration(
-        override val position: Position,
-        override val appendedAt: Instant,
-        val configuration: dev.svilenivanov.raftkt.Configuration
-    ) : Log()
+        @Serializable
+        data class Configuration(
+            val configuration: dev.svilenivanov.raftkt.Configuration
+        ) : Data()
+    }
 }
 
 

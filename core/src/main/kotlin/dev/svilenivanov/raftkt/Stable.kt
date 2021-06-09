@@ -1,9 +1,8 @@
 package dev.svilenivanov.raftkt
 
-interface StableStore {
-    suspend fun set(key: ByteArray, value: ByteArray)
-    suspend fun get(key: ByteArray): ByteArray?
+import kotlinx.serialization.Serializable
 
-    suspend fun setLong(key: ByteArray, value: Long)
-    suspend fun getLong(key: ByteArray): Long?
+interface StableStore {
+    suspend fun <T> set(key: ByteArray, value: T)
+    suspend fun <T> get(key: ByteArray): T?
 }

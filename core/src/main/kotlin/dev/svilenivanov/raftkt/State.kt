@@ -73,6 +73,7 @@ class RaftState {
     fun setCurrentTerm(newTerm: Long) {
         currentTerm.value = newTerm
     }
+    fun incrementCurrentTerm() = currentTerm.incrementAndGet()
 
     suspend fun getLastLog() = lastLock.withLock { lastLog }
     suspend fun setLastLog(newLastLog: Position) = lastLock.withLock { lastLog = newLastLog }

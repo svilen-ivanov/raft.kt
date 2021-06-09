@@ -15,7 +15,7 @@ import kotlinx.coroutines.sync.withLock
 // 'startIndex' is the first index created in this term (see
 // its description above).
 class Commitment(
-    private val commitCh: SendChannel<EmptyMessage>,
+    private val commitCh: SendChannel<Unit>,
     configuration: Configuration,
     private val startIndex: Long
 ) {
@@ -55,7 +55,7 @@ class Commitment(
         val quorumMatchIndex = matched[(matched.size - 1) / 2]
         if (quorumMatchIndex > commitIndex && quorumMatchIndex >= startIndex) {
             commitIndex = quorumMatchIndex
-            commitCh.trySend(EmptyMessage)
+            commitCh.trySend(Unit)
         }
     }
 }

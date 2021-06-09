@@ -26,7 +26,7 @@ internal class CommitmentTest {
     // Tests setVoters() keeps matchIndexes where possible.
     @Test
     fun setVoters() = runBlockingTest {
-        val commitCh = Channel<EmptyMessage>(1)
+        val commitCh = Channel<Unit>(1)
         val c = Commitment(commitCh, makeConfiguration(listOf(SERVER_A, SERVER_B, SERVER_C)), 0)
         c.match(SERVER_A, 10)
         c.match(SERVER_B, 20)
@@ -43,7 +43,7 @@ internal class CommitmentTest {
     // Tests match() being called with smaller index than before.
     @Test
     fun matchMax() = runBlockingTest {
-        val commitCh = Channel<EmptyMessage>(1)
+        val commitCh = Channel<Unit>(1)
         val c = Commitment(commitCh, voters(5), 4)
         c.match(SERVER_1, 8)
         c.match(SERVER_2, 8)
@@ -56,7 +56,7 @@ internal class CommitmentTest {
     // Tests match() being called with non-voters.
     @Test
     fun matchNonVoting() = runBlockingTest {
-        val commitCh = Channel<EmptyMessage>(1)
+        val commitCh = Channel<Unit>(1)
         val c = Commitment(commitCh, voters(5), 4)
 
         c.match(SERVER_1, 8)
@@ -76,7 +76,7 @@ internal class CommitmentTest {
     // Tests recalculate() algorithm.
     @Test
     fun recalculate() = runBlockingTest {
-        val commitCh = Channel<EmptyMessage>(1)
+        val commitCh = Channel<Unit>(1)
         val c = Commitment(commitCh, voters(5), 0)
 
         c.match(SERVER_1, 30)
@@ -116,7 +116,7 @@ internal class CommitmentTest {
     // Tests recalculate() respecting startIndex.
     @Test
     fun recalculateStartIndex() = runBlockingTest {
-        val commitCh = Channel<EmptyMessage>(1)
+        val commitCh = Channel<Unit>(1)
         val c = Commitment(commitCh, voters(5), 4)
 
         c.match(SERVER_1, 3)
@@ -137,7 +137,7 @@ internal class CommitmentTest {
     // With no voting members in the cluster, the most sane behavior is probably to not mark anything committed.
     @Test
     fun noVoterSanity() = runBlockingTest {
-        val commitCh = Channel<EmptyMessage>(1)
+        val commitCh = Channel<Unit>(1)
         val c = Commitment(commitCh, makeConfiguration(), 4)
         c.match(SERVER_1, 10)
         c.setConfiguration(makeConfiguration())
@@ -160,7 +160,7 @@ internal class CommitmentTest {
     // Single voter commits immediately.
     @Test
     fun singleVoter() = runBlockingTest {
-        val commitCh = Channel<EmptyMessage>(1)
+        val commitCh = Channel<Unit>(1)
         val c = Commitment(commitCh, voters(1), 4)
 
         c.match(SERVER_1, 10)

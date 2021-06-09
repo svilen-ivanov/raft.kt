@@ -50,7 +50,7 @@ sealed class Rpc : RpcHeaderProp {
 
         // Provide the term and our id
         val term: Long,
-        val candidate: ServerId,
+        val candidate: Peer,
 
         // Used to ensure safety
         val lastLogIndex: Long,
@@ -79,7 +79,7 @@ sealed class Rpc : RpcHeaderProp {
         val snapshotVersion: SnapshotVersion,
         // Provide the current term and leader
         val term: Long,
-        val leader: ServerId,
+        val leader: Peer,
         // These are the last index/term included in the snapshot
         val lastLogIndex: Long,
         val lastLogTerm: Long,

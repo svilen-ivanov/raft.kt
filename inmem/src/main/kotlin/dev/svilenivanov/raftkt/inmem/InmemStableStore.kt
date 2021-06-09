@@ -5,23 +5,12 @@ import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 
 class InmemStableStore : StableStore {
-    private val kv = ConcurrentHashMap<Int, ByteArray>()
+    private val kv = ConcurrentHashMap<Int, Any>()
 
-    override suspend fun set(key: ByteArray, value: ByteArray) {
-        kv[key.contentHashCode()] = value
+    override suspend fun <T> set(key: ByteArray, value: T) {
+        kv[key.contentHashCode()] = value as Any
     }
 
-    override suspend fun get(key: ByteArray) = kv[key.contentHashCode()]
-
-    override suspend fun setLong(key: ByteArray, value: Long) {
-        val buffer = ByteBuffer.allocate(Long.SIZE_BYTES)
-        buffer.putLong(value)
-        set(key, buffer.array())
-    }
-
-    override suspend fun getLong(key: ByteArray): Long? {
-        return get(key)?.run {
-            ByteBuffer.wrap(this).long
-        }
-    }
+    @Suppress("UNCHECKED_CAST")
+    override suspend fun <T> get(key: ByteArray) = kv[key.contentHashCode()] as T?
 }

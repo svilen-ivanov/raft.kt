@@ -127,8 +127,11 @@ data class Server(
     // ID is a unique string identifying this server for all time.
     val serverId: ServerId,
     // Address is its network address that a transport can contact.
-    val address: ServerAddress
-)
+    val address: ServerAddress,
+) {
+    val peer: Peer
+        get() = Peer(serverId, address)
+}
 
 // ServerSuffrage determines whether a Server in a Configuration gets a vote.
 @Serializable

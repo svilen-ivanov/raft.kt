@@ -23,15 +23,15 @@ internal class InmemLogStoreTest {
     @Test
     fun store() = runBlockingTest {
         val store = InmemLogStore()
-        val log1 = Log.Command(Position(1, 1), Clock.System.now(), "data1")
+        val log1 = Log(Position(1, 1), Clock.System.now(), Log.Data.Command("data1"))
         store.storeLog(log1)
         store.firstIndex() shouldBe 1
         store.lastIndex() shouldBe 1
-        val log2 = Log.Command(Position(2, 1), Clock.System.now(), "data2")
+        val log2 = Log(Position(2, 1), Clock.System.now(), Log.Data.Command("data2"))
         store.storeLog(log2)
         store.firstIndex() shouldBe 1
         store.lastIndex() shouldBe 2
-        val log3 = Log.Command(Position(3, 1), Clock.System.now(), "data3")
+        val log3 = Log(Position(3, 1), Clock.System.now(), Log.Data.Command("data3"))
         store.storeLog(log3)
         store.firstIndex() shouldBe 1
         store.lastIndex() shouldBe 3

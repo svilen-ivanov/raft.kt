@@ -18,8 +18,6 @@ import kotlinx.datetime.Instant
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import kotlin.coroutines.coroutineContext
-import kotlin.random.Random
-import kotlin.time.Duration
 
 // This is the current suggested max size of the data in a raft log entry.
 // This is based on current architecture, default timing, etc. Clients can
@@ -32,23 +30,23 @@ import kotlin.time.Duration
 // potentially causing leadership instability.
 const val SuggestedMaxDataSize = 512 * 1024
 
-sealed class Error(message: String) : Throwable(message) {
+sealed class RaftError(message: String) : Throwable(message) {
+    class Unspecified(message: String) : RaftError(message)
 
-    object ErrNotLeader : Error("node is not the leader")
-    object ErrLeadershipLost : Error("leadership lost while committing log")
-    object ErrAbortedByRestore : Error("snapshot restored while committing log")
-    object ErrRaftShutdown : Error("raft is already shutdown")
-    object ErrEnqueueTimeout : Error("timed out enqueuing operation")
-    object ErrNothingNewToSnapshot : Error("nothing new to snapshot")
-    object ErrUnsupportedProtocol : Error("operation not supported with current protocol version")
-    object ErrCantBootstrap : Error("bootstrap only works on new clusters")
-    object ErrLeadershipTransferInProgress : Error("leadership transfer in progress")
-    object ErrLeadershipTransferTimeout : Error("leadership transfer timeout")
-    object ErrLeadershipTransferLost : Error("lost leadership during transfer (expected)")
-    object ErrCannotFindPeer : Error("cannot find peer")
-    class GeneralError(message: String) : Error(message)
-    class GeneralException(cause: Throwable) : Error(cause.toString())
-    class ErrUnexpectedRequest(request: Rpc.Request) : Error("expected heartbeat, got ${request::class}")
+    object ErrNotLeader : RaftError("node is not the leader")
+    object ErrLeadershipLost : RaftError("leadership lost while committing log")
+    object ErrAbortedByRestore : RaftError("snapshot restored while committing log")
+    object ErrRaftShutdown : RaftError("raft is already shutdown")
+    object ErrEnqueueTimeout : RaftError("timed out enqueuing operation")
+    object ErrNothingNewToSnapshot : RaftError("nothing new to snapshot")
+    object ErrUnsupportedProtocol : RaftError("operation not supported with current protocol version")
+    object ErrCantBootstrap : RaftError("bootstrap only works on new clusters")
+    object ErrLeadershipTransferInProgress : RaftError("leadership transfer in progress")
+    object ErrLeadershipTransferTimeout : RaftError("leadership transfer timeout")
+    object ErrLeadershipTransferLost : RaftError("lost leadership during transfer (expected)")
+    object ErrCannotFindPeer : RaftError("cannot find peer")
+    class GeneralException(cause: Throwable) : RaftError(cause.toString())
+    class ErrUnexpectedRequest(request: Rpc.Request) : RaftError("expected heartbeat, got ${request::class}")
 }
 
 class Raft<T, E, R> private constructor(
@@ -372,7 +370,7 @@ class Raft<T, E, R> private constructor(
                         leaderState!!.stepDown.onReceive { raftState.setState(FOLLOWER) }
                         leadershipTransferCh.onReceive { lt ->
                             if (leaderState!!.leadershipTransferInProgress.value) {
-                                lt.response.completeExceptionally(Error.ErrLeadershipTransferInProgress)
+                                lt.response.completeExceptionally(RaftError.ErrLeadershipTransferInProgress)
                                 return@onReceive
                             }
                             val req = lt.request!!
@@ -380,7 +378,7 @@ class Raft<T, E, R> private constructor(
                             val leftLeaderLoop = Channel<Any>()
                             cleanup += { leftLeaderLoop.close() }
                             val stopCh = Channel<Unit>()
-                            val doneCh = Channel<Error?>(1)
+                            val doneCh = Channel<RaftError?>(1)
 
                             // This is intentionally being setup outside of the
                             // leadershipTransfer function. Because the TimeoutNow
@@ -391,16 +389,16 @@ class Raft<T, E, R> private constructor(
                             launch {
                                 withTimeout(config.value.electionTimeout) {
                                     stopCh.close()
-                                    lt.response.completeExceptionally(Error.ErrLeadershipTransferTimeout)
+                                    lt.response.completeExceptionally(RaftError.ErrLeadershipTransferTimeout)
                                     logger.debug("leadership transfer timeout")
-                                    doneCh.send(Error.ErrLeadershipTransferTimeout)
+                                    doneCh.send(RaftError.ErrLeadershipTransferTimeout)
                                 }
                                 select<Unit> {
                                     leftLeaderLoop.onReceiveCatching {
                                         stopCh.close()
-                                        lt.response.completeExceptionally(Error.ErrLeadershipTransferLost)
+                                        lt.response.completeExceptionally(RaftError.ErrLeadershipTransferLost)
                                         logger.debug("lost leadership during transfer (expected)")
-                                        doneCh.send(Error.ErrLeadershipTransferLost)
+                                        doneCh.send(RaftError.ErrLeadershipTransferLost)
                                     }
                                     doneCh.onReceiveCatching {
                                         lt.respond { }
@@ -415,13 +413,13 @@ class Raft<T, E, R> private constructor(
                             val peer = lt.request.run { pickServer()?.peer }
                             if (peer == null) {
                                 logger.error("cannot find peer")
-                                doneCh.send(Error.ErrCannotFindPeer)
+                                doneCh.send(RaftError.ErrCannotFindPeer)
                                 return@onReceive
                             }
                             val state = leaderState!!.replState[peer.id]
                             if (state == null) {
                                 logger.error("cannot find replication state for {}", peer.id)
-                                doneCh.send(Error.GeneralError("cannot find replication state for $peer.id"))
+                                doneCh.send(RaftError.Unspecified("cannot find replication state for $peer.id"))
                                 return@onReceive
                             }
                             launch {
@@ -489,7 +487,7 @@ class Raft<T, E, R> private constructor(
                                     leaderState!!.replState.forEach { (_, _) ->
 //                                        state.cleanupNotify(v)
                                     }
-                                    r.response.completeExceptionally(Error.ErrNotLeader)
+                                    r.response.completeExceptionally(RaftError.ErrNotLeader)
                                 }
                                 else -> {
                                     // Quorum of members agree, we are still leader
@@ -540,7 +538,7 @@ class Raft<T, E, R> private constructor(
         peer: Peer,
         state: FollowerReplication,
         stopCh: Channel<Unit>,
-        doneCh: Channel<Error?>
+        doneCh: Channel<RaftError?>
     ) {
 
         if (!stopCh.isEmpty) {
@@ -562,7 +560,7 @@ class Raft<T, E, R> private constructor(
                         }
                     }
                 } catch (e: Exception) {
-                    doneCh.send(Error.GeneralException(e))
+                    doneCh.send(RaftError.GeneralException(e))
                     break
                 }
             }
@@ -581,7 +579,7 @@ class Raft<T, E, R> private constructor(
                 transport.timoutNow(peer)
                 doneCh.send(null)
             } catch (e: Exception) {
-                doneCh.send(Error.GeneralException(e))
+                doneCh.send(RaftError.GeneralException(e))
             }
         } finally {
             leaderState!!.leadershipTransferInProgress.value = false
@@ -642,7 +640,7 @@ class Raft<T, E, R> private constructor(
         setLastContact()
 
         leaderState!!.inflight.forEach {
-            it.response.completeExceptionally(Error.ErrLeadershipLost)
+            it.response.completeExceptionally(RaftError.ErrLeadershipLost)
         }
 
         // Respond to any pending verify requests
@@ -874,7 +872,7 @@ class Raft<T, E, R> private constructor(
             checkRpcHeader(message.request.header)
             when (message.request) {
                 is Rpc.AppendEntriesRequest -> appendEntries(message.request)
-                else -> throw Error.ErrUnexpectedRequest(message.request)
+                else -> throw RaftError.ErrUnexpectedRequest(message.request)
             }
         }
     }
@@ -1150,7 +1148,7 @@ class Raft<T, E, R> private constructor(
         try {
             fsmMutateCh.send(batch.asSequence())
         } catch (e: CancellationException) {
-            batch.forEach { message -> message.response.completeExceptionally(Error.ErrRaftShutdown) }
+            batch.forEach { message -> message.response.completeExceptionally(RaftError.ErrRaftShutdown) }
             throw e
         }
     }
@@ -1161,16 +1159,16 @@ class Raft<T, E, R> private constructor(
 
     private fun checkRpcHeader(header: RpcHeader) {
         if (header.protocolVersion != ProtocolVersion.VERSION_3) {
-            throw Error.ErrUnsupportedProtocol
+            throw RaftError.ErrUnsupportedProtocol
         }
     }
 
     private fun respondNotLeader(message: Message<*, *>) {
-        message.response.completeExceptionally(Error.ErrNotLeader)
+        message.response.completeExceptionally(RaftError.ErrNotLeader)
     }
 
     private fun respondCannotBootstrap(message: Message<Configuration, Unit>) {
-        message.response.completeExceptionally(Error.ErrCantBootstrap)
+        message.response.completeExceptionally(RaftError.ErrCantBootstrap)
     }
 
     suspend fun waitShutdown() {

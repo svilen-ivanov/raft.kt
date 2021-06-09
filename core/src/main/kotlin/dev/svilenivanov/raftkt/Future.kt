@@ -7,7 +7,7 @@ import kotlinx.coroutines.sync.withLock
 import java.time.Instant
 
 // Future is used to represent an action that may occur in the future.
-interface Future {
+private interface Future {
     // Error blocks until the future arrives and then returns the error status
     // of the future. This may be called any number of times - all calls will
     // return the same value, however is not OK to call this method twice
@@ -15,18 +15,18 @@ interface Future {
     // Error will only return generic errors related to raft, such
     // as ErrLeadershipLost, or ErrRaftShutdown. Some operations, such as
     // ApplyLog, may also return errors from other methods.
-    suspend fun error(): Error?
+    suspend fun error(): RaftError?
 }
 
 // IndexFuture is used for future actions that can result in a raft log entry
 // being created.
-interface IndexFuture : Future {
+private interface IndexFuture : Future {
     // Index holds the index of the newly applied log entry.
     // This must not be called until after the Error method has returned.
     fun index(): Long
 }
 
-interface ApplyFuture<T> : IndexFuture {
+private interface ApplyFuture<T> : IndexFuture {
     // Response returns the FSM response as returned by the FSM.Apply method. This
     // must not be called until after the Error method has returned.
     // Note that if FSM.Apply returns an error, it will be returned by Response,
@@ -37,7 +37,7 @@ interface ApplyFuture<T> : IndexFuture {
 
 // ConfigurationFuture is used for GetConfiguration and can return the
 // latest configuration in use by Raft.
-interface ConfigurationFuture : IndexFuture {
+private interface ConfigurationFuture : IndexFuture {
 
     // Configuration contains the latest configuration. This must
     // not be called until after the Error method has returned.
@@ -45,24 +45,24 @@ interface ConfigurationFuture : IndexFuture {
 }
 
 // SnapshotFuture is used for waiting on a user-triggered snapshot to complete.
-interface SnapshotFuture : Future {
+private interface SnapshotFuture : Future {
     // Open is a function you can call to access the underlying snapshot and
     // its metadata. This must not be called until after the Error method
     // has returned.
     fun open(): SnapshotOpenReturn
 
-    data class SnapshotOpenReturn(val snapshotMeta: SnapshotMeta, val reader: Reader, val error: Error)
+    data class SnapshotOpenReturn(val snapshotMeta: SnapshotMeta, val reader: Reader, val error: RaftError)
 }
 
-class ErrorFuture<T>(private val err: Error) : Future, IndexFuture, ApplyFuture<T?> {
+class ErrorFuture<T>(private val err: RaftError) : Future, IndexFuture, ApplyFuture<T?> {
     override suspend fun error() = err
     override fun response(): Nothing? = null
     override fun index() = 0L
 }
 
 open class DeferError(
-    private var err: Error? = null,
-    private var errCh: Channel<Error>? = null,
+    private var err: RaftError? = null,
+    private var errCh: Channel<RaftError?>? = null,
     private var responded: Boolean = false,
     private val shutdownCh: Channel<Unit>? = null
 ) {
@@ -70,26 +70,25 @@ open class DeferError(
         errCh = Channel(1)
     }
 
-    suspend fun error(): Error? {
+    suspend fun error(): RaftError? {
         if (err != null) return err
-        checkNotNull(errCh) { "waiting for response on nil channel" }
+        checkNotNull(errCh) { "waiting for response on null channel" }
         select<Unit> {
             errCh?.onReceiveCatching {
                 err = it.getOrNull()
             }
             shutdownCh?.onReceiveCatching {
-                err = Error.ErrRaftShutdown
+                err = RaftError.ErrRaftShutdown
             }
         }
         return err
     }
 
-    suspend fun respond(err: Error) {
+    suspend fun respond(err: RaftError?) {
         if (errCh == null || responded) return
         errCh!!.run {
             send(err)
             close()
-            errCh = null
             responded = true
         }
     }
@@ -124,7 +123,7 @@ class BootstrapFuture<R>(
 class ShutdownFuture<T, E, R> : Future {
     var raft: Raft<T, E, R>? = null
 
-    override suspend fun error(): Error? {
+    override suspend fun error(): RaftError? {
         if (raft == null) return null
         raft!!.run {
             waitShutdown()
@@ -145,14 +144,14 @@ class UserSnapshotFuture(
     sealed class OpenerResult(
         private val meta: SnapshotMeta?,
         private val readCloser: ReadCloser?,
-        private val error: Error?
+        private val error: RaftError?
     ) {
         operator fun component1() = meta
         operator fun component2() = readCloser
         operator fun component3() = error
     }
 
-    object ErrNoSnapshot : Error("no snapshot available")
+    object ErrNoSnapshot : RaftError("no snapshot available")
     object NoSnapshot : OpenerResult(null, null, ErrNoSnapshot)
 
     suspend fun open(): OpenerResult {

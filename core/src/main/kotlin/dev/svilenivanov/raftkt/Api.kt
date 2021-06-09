@@ -319,7 +319,7 @@ class Raft<T, E, R> private constructor(
     private suspend fun runLeader() {
         logger.info("entering candidate state: node={}", localPeer)
         // Notify that we are the leader
-        overrideNotifyBool(leaderCh, true)
+        leaderCh.overrideNotify(true)
 
         // Store the notify chan. It's not reloadable so shouldn't change before the
         // defer below runs, but this makes sure we always notify the same chan if
@@ -657,7 +657,7 @@ class Raft<T, E, R> private constructor(
         leader.update {
             if (it != null && it.address == localAddr) null else it
         }
-        overrideNotifyBool(leaderCh, false)
+        leaderCh.overrideNotify(false)
 
         if (notifyCh != null) {
             notifyCh!!.trySend(false)

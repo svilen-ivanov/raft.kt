@@ -1,12 +1,9 @@
 package dev.svilenivanov.raftkt
 
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.channels.SendChannel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import kotlin.random.Random
 import kotlin.time.Duration
 
@@ -38,23 +35,13 @@ data class Message<REQ, RES>(
     }
 }
 
-suspend fun overrideNotifyBool(leaderCh: Channel<Boolean>, b: Boolean) {
-    if (leaderCh.trySend(b).isSuccess) return
-    while (!leaderCh.isEmpty) {
-        leaderCh.receive()
-    }
-    if (!leaderCh.trySend(b).isSuccess) {
-        throw IllegalStateException("race: channel was sent concurrently")
-    }
-}
-
 private fun calcRandomTimeout(timeout: Duration): Duration {
     return Duration.milliseconds(timeout.inWholeMilliseconds + Random.nextLong(timeout.inWholeMilliseconds))
 }
 
 // randomTimeout returns a value that is between the minVal and 2x minVal.
 fun CoroutineScope.randomTimeout(channel: Channel<Unit>, minVal: Duration) {
-    launch {
+    launch(CoroutineName("randomTimeout ($minVal)")) {
         delay(calcRandomTimeout(minVal))
         channel.send(Unit)
     }
@@ -88,6 +75,15 @@ fun <E> Channel<E>.overrideNotify(value: E) {
     }
 }
 
+fun backoff(base: Duration, round: Long, limit: Long): Duration {
+    var newBase = base
+    var power = minOf(round, limit)
+    while (power > 2) {
+        newBase *= 2
+        power--
+    }
+    return newBase
+}
 
 
 

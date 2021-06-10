@@ -66,6 +66,10 @@ open class DeferError(
     private var responded: Boolean = false,
     private val shutdownCh: Channel<Unit>? = null
 ) {
+
+    val errChan: Channel<RaftError?>
+        get() = errCh!!
+
     fun init() {
         errCh = Channel(1)
     }
@@ -120,12 +124,11 @@ class BootstrapFuture<R>(
     val configuration: Configuration
 ) : LogFuture<R>()
 
-class ShutdownFuture<T, E, R> : Future {
-    var raft: Raft<T, E, R>? = null
+class ShutdownFuture<T, E, R>(val raft: Raft<T, E, R>? = null) : Future {
 
     override suspend fun error(): RaftError? {
         if (raft == null) return null
-        raft!!.run {
+        raft.run {
             waitShutdown()
             closeTransport()
         }

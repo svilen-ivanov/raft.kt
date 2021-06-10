@@ -11,6 +11,7 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 internal class UtilTest {
+
     @Test
     fun testRandomTimeout() = runBlockingTest {
         val channel = Channel<Unit>(1)

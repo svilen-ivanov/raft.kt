@@ -41,15 +41,24 @@ private fun calcRandomTimeout(timeout: Duration): Duration {
 
 // randomTimeout returns a value that is between the minVal and 2x minVal.
 fun CoroutineScope.randomTimeout(channel: Channel<Unit>, minVal: Duration) {
-    launch(CoroutineName("randomTimeout ($minVal)")) {
-        delay(calcRandomTimeout(minVal))
+    fixedTimeout(channel, calcRandomTimeout(minVal), "random")
+}
+
+/**
+ * returns a value ([Unit]) in the [channel] after around [duration] time
+ *
+ * [debugName] It sets the prefix of the coroutine name to ease debugging
+ */
+fun CoroutineScope.fixedTimeout(channel: Channel<Unit>, duration: Duration, debugName: String = "fixed") {
+    launch(CoroutineName("$debugName timeout ($duration)")) {
+        delay(duration)
         channel.send(Unit)
     }
 }
 
 // asyncNotifyCh is used to do an async channel send
 // to a single channel without blocking.
-fun <E> SendChannel<E>.asyncNotifyCh(value: E) =  trySend(value).isSuccess
+fun <E> SendChannel<E>.asyncNotifyCh(value: E) = trySend(value).isSuccess
 
 // drainNotifyCh empties out a single-item notification channel without
 // blocking, and returns whether it received anything.

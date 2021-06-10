@@ -1,7 +1,6 @@
 package dev.svilenivanov.raftkt
 
 import io.kotest.matchers.shouldBe
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runBlockingTest
 import org.junit.jupiter.api.Test

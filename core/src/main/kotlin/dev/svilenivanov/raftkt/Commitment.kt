@@ -17,7 +17,7 @@ import kotlinx.coroutines.sync.withLock
 class Commitment(
     private val commitCh: SendChannel<Unit>,
     configuration: Configuration,
-    private val startIndex: Long
+    val startIndex: Long
 ) {
     private val lock = Mutex()
     private var matchIndexes: MutableMap<ServerId, Long> =

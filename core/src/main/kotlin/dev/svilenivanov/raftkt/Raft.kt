@@ -21,8 +21,8 @@ class LeaderState<R>(
     val leadershipTransferInProgress: AtomicBoolean = atomic(false),
     val commitCh: Channel<Unit>,
     val commitment: Commitment,
-    val inflight: MutableList<Message<Log, R?>>,
-    val replState: Map<ServerId, FollowerReplication>,
-    val notify: MutableSet<Message<Verify, Unit>>,
-    val stepDown: Channel<Any>,
+    val inflight: MutableList<LogFuture<R>>,
+    val replState: MutableMap<ServerId, FollowerReplication>,
+    val notify: MutableSet<VerifyFuture>,
+    val stepDown: Channel<Unit>,
 )

@@ -3,13 +3,17 @@
 package dev.svilenivanov.raftkt
 
 import dev.svilenivanov.raftkt.Observation.LeaderObservation
+import dev.svilenivanov.raftkt.RaftError.*
 import dev.svilenivanov.raftkt.ServerSuffrage.VOTER
 import dev.svilenivanov.raftkt.State.*
 import kotlinx.atomicfu.atomic
 import kotlinx.atomicfu.getAndUpdate
 import kotlinx.atomicfu.update
 import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.*
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ReceiveChannel
+import kotlinx.coroutines.channels.SendChannel
+import kotlinx.coroutines.selects.onTimeout
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -17,7 +21,10 @@ import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
-import kotlin.coroutines.coroutineContext
+import kotlin.coroutines.CoroutineContext
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.ZERO
+import kotlin.time.Duration.Companion.milliseconds
 
 // This is the current suggested max size of the data in a raft log entry.
 // This is based on current architecture, default timing, etc. Clients can
@@ -29,9 +36,13 @@ import kotlin.coroutines.coroutineContext
 // timely heartbeat signals which are sent in serial in current transports,
 // potentially causing leadership instability.
 const val SuggestedMaxDataSize = 512 * 1024
+val minCheckInterval = milliseconds(10)
 
 sealed class RaftError(message: String) : Throwable(message) {
-    class Unspecified(message: String) : RaftError(message)
+    class Unspecified : RaftError {
+        constructor(message: String) : super(message)
+        constructor(cause: Throwable) : super(cause.toString())
+    }
 
     object ErrNotLeader : RaftError("node is not the leader")
     object ErrLeadershipLost : RaftError("leadership lost while committing log")
@@ -45,7 +56,6 @@ sealed class RaftError(message: String) : Throwable(message) {
     object ErrLeadershipTransferTimeout : RaftError("leadership transfer timeout")
     object ErrLeadershipTransferLost : RaftError("lost leadership during transfer (expected)")
     object ErrCannotFindPeer : RaftError("cannot find peer")
-    class GeneralException(cause: Throwable) : RaftError(cause.toString())
     class ErrUnexpectedRequest(request: Rpc.Request) : RaftError("expected heartbeat, got ${request::class}")
 }
 
@@ -62,9 +72,13 @@ class Raft<T, E, R> private constructor(
     private val snapshots: SnapshotStore,
     // The transport layer we use
     private val transport: Transport,
+
+    private val context: CoroutineContext,
     // clock
     private val clock: Clock = Clock.System
 ) {
+    val scope = CoroutineScope(context)
+
     companion object {
         @JvmStatic
         private val logger: Logger = LoggerFactory.getLogger(Raft::class.java)
@@ -75,9 +89,10 @@ class Raft<T, E, R> private constructor(
             logs: LogStore,
             stable: StableStore,
             snaps: SnapshotStore,
-            transport: Transport
+            transport: Transport,
+            context: CoroutineContext
         ): Raft<T, E, R> {
-            return Raft(config, fsm, logs, stable, snaps, transport).apply { init() }
+            return Raft(config, fsm, logs, stable, snaps, transport, context).apply { init() }
         }
     }
 
@@ -88,7 +103,7 @@ class Raft<T, E, R> private constructor(
 
     // applyCh is used to async send logs to the main thread to
     // be committed and applied to the FSM.
-    private lateinit var applyCh: Channel<Message<Log, R>>
+    private lateinit var applyCh: Channel<LogFuture<R>>
 
     // conf stores the current configuration to use. This is the most recent one
     // provided. All reads of config values should use the config() helper method
@@ -107,7 +122,7 @@ class Raft<T, E, R> private constructor(
     // restores so that we finish applying any old log applies before we
     // take a user snapshot on the leader, otherwise we might restore the
     // snapshot and apply old logs to it that were in the pipe.
-    private lateinit var fsmMutateCh: Channel<Sequence<Message<Log, R?>>>
+    private lateinit var fsmMutateCh: Channel<List<CommitTuple<R>>>
 
     // fsmSnapshotCh is used to trigger a new snapshot being taken
     private lateinit var fsmSnapshotCh: Channel<Any>
@@ -138,7 +153,7 @@ class Raft<T, E, R> private constructor(
     private val localAddr: ServerAddress get() = transport.localAddr
 
     // Used to request the leader to make configuration changes.
-    private lateinit var configurationChangeCh: Channel<Message<Configuration, Unit>>
+    private lateinit var configurationChangeCh: Channel<ConfigurationChangeFuture<R>>
 
     // Tracks the latest configuration and latest committed configuration from
     // the log/snapshot.
@@ -153,25 +168,26 @@ class Raft<T, E, R> private constructor(
     private lateinit var rpcCh: ReceiveChannel<Message<Rpc.Request, Rpc.Response>>
 
     // Shutdown channel to exit, protected to prevent concurrent exits
+    private val shutdownCh = Channel<Unit>()
     private var shutdown: Boolean = false
-    private val shutdownMutex = Mutex()
+    private val shutdownLock = Mutex()
 
     // userSnapshotCh is used for user-triggered snapshots
     private lateinit var userSnapshotCh: Channel<Any>
 
     // userRestoreCh is used for user-triggered restores of external snapshots
-    private lateinit var userRestoreCh: Channel<Message<Any, Any>>
+    private lateinit var userRestoreCh: Channel<UserRestoreFuture>
 
     // verifyCh is used to async send verify futures to the main thread
     // to verify we are still the leader
-    private lateinit var verifyCh: Channel<Message<Verify, Unit>>
+    private lateinit var verifyCh: Channel<VerifyFuture>
 
     // configurationsCh is used to get the configuration data safely from
     // outside of the main thread.
-    private lateinit var configurationsCh: Channel<Message<Unit, Configurations>>
+    private lateinit var configurationsCh: Channel<ConfigurationsFuture>
 
     // bootstrapCh is used to attempt an initial bootstrap from outside of the main thread.
-    private lateinit var bootstrapCh: Channel<Message<Configuration, Unit>>
+    private lateinit var bootstrapCh: Channel<BootstrapFuture<R>>
 
     // List of observers and the mutex that protects them. The observers list
     // is indexed by an artificial ID which is used for deregistration.
@@ -180,7 +196,7 @@ class Raft<T, E, R> private constructor(
 
     // leadershipTransferCh is used to start a leadership transfer from outside of
     // the main thread.
-    private lateinit var leadershipTransferCh: Channel<Message<Peer?, Unit>>
+    private lateinit var leadershipTransferCh: Channel<LeadershipTransferFuture>
 
     // NotifyCh is used to provide a channel that will be notified of leadership
     // changes. Raft will block writing to this channel, so it should either be
@@ -303,18 +319,140 @@ class Raft<T, E, R> private constructor(
     }
 
     private suspend fun run() {
-        while (coroutineContext.isActive) {
-            return when (raftState.getState()) {
+        while (context.isActive) {
+            if (shutdownCh.tryReceive().isSuccess) {
+                setLeader(null)
+                return
+            }
+            when (raftState.getState()) {
                 FOLLOWER -> runFollower()
                 CANDIDATE -> runCandidate()
                 LEADER -> runLeader()
                 SHUTDOWN -> {
                     setLeader(null)
-                    break
+                    return
                 }
             }
         }
     }
+
+    private suspend fun runFollower() {
+        var didWarn = false
+        logger.info("entering follower state: follower={}, leader={}", localPeer, this.leader.value)
+
+        coroutineScope {
+            val heartbeatTimer = Channel<Unit>()
+            randomTimeout(heartbeatTimer, config.value.heartbeatTimeout)
+            while (isActive && raftState.getState() == FOLLOWER) {
+                select<Unit> {
+                    rpcCh.onReceive { processRpc(it) }
+                    configurationChangeCh.onReceive { respondNotLeader(it) }
+                    applyCh.onReceive { respondNotLeader(it) }
+                    verifyCh.onReceive { respondNotLeader(it) }
+                    userRestoreCh.onReceive { respondNotLeader(it) }
+                    leadershipTransferCh.onReceive { respondNotLeader(it) }
+                    configurationsCh.onReceive { c ->
+                        c.configurations = configurations
+                    }
+                    bootstrapCh.onReceive { b ->
+                        b.respond(
+                            try {
+                                liveBootstrap(b.configuration)
+                                null
+                            } catch (e: Exception) {
+                                Unspecified(e)
+                            }
+                        )
+                    }
+                    heartbeatTimer.onReceive {
+                        val hbTimeout = config.value.heartbeatTimeout
+                        randomTimeout(heartbeatTimer, hbTimeout)
+                        if (clock.now().minus(lastContact.value) >= hbTimeout) {
+                            val lastLeader = setLeader(null)
+                            if (configurations.latestIndex == 0L) {
+                                logger.warn("no known peers, aborting election")
+                            } else if (configurations.latestIndex == configurations.committedIndex
+                                && !configurations.latest.hasVote(localId)
+                            ) {
+                                logger.warn("not part of stable configuration, aborting election")
+                            } else {
+                                logger.warn("heartbeat timeout reached, starting election, last-leader={}", lastLeader)
+                                raftState.setState(CANDIDATE)
+                                cancel("heartbeat timeout reached, starting election")
+                            }
+                        }
+                    }
+                    shutdownCh.onReceive {
+                        cancel("shutting down")
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun runCandidate() {
+        logger.info("entering candidate state: node={}, term={}", localPeer, raftState.getCurrentTerm() + 1)
+        val voteCh = electSelf()
+        try {
+            coroutineScope {
+                val electionTimer = Channel<Unit>()
+                randomTimeout(electionTimer, config.value.electionTimeout)
+                // Tally the votes, need a simple majority
+                var grantedVotes = 0
+                val votesNeeded = quorumSize()
+                logger.debug("votes, needed={}", votesNeeded)
+                while (isActive && raftState.getState() == CANDIDATE) {
+                    select<Unit> {
+                        rpcCh.onReceive { processRpc(it) }
+                        voteCh.onReceive { (peer, vote) ->
+                            // Check if the term is greater than ours, bail
+                            if (vote.term > raftState.getCurrentTerm()) {
+                                logger.debug("newer term discovered, fallback to follower, vote={}", vote)
+                                raftState.setState(FOLLOWER)
+                                raftState.setCurrentTerm(vote.term)
+                                cancel("new term")
+                            }
+                            // Check if the vote is granted
+                            if (vote.granted) {
+                                grantedVotes++
+                                logger.debug("vote granted, from={}, term={}, tally={}", peer, vote.term, grantedVotes)
+                            }
+                            // Check if we've become the leader
+                            if (grantedVotes >= votesNeeded) {
+                                logger.info("election won, tally={}", grantedVotes)
+                                raftState.setState(LEADER)
+                                setLeader(localPeer)
+                            }
+                        }
+                        configurationChangeCh.onReceive { respondNotLeader(it) }
+                        applyCh.onReceive { respondNotLeader(it) }
+                        verifyCh.onReceive { respondNotLeader(it) }
+                        userRestoreCh.onReceive { respondNotLeader(it) }
+                        leadershipTransferCh.onReceive { respondNotLeader(it) }
+                        configurationsCh.onReceive { c ->
+                            c.configurations = configurations
+                        }
+                        bootstrapCh.onReceive { respondCannotBootstrap(it) }
+                        electionTimer.onReceive {
+                            logger.warn("Election timeout reached, restarting election")
+                            cancel("election timeout")
+                        }
+                        shutdownCh.onReceive {
+                            cancel("shutting down")
+                        }
+                    }
+                }
+            }
+        } finally {
+            // Make sure the leadership transfer flag is reset after each run. Having this
+            // flag will set the field LeadershipTransfer in a RequestVoteRequest to true,
+            // which will make other servers vote even though they have a leader already.
+            // It is important to reset that flag, because this privilege could be abused
+            // otherwise.
+            candidateFromLeadershipTransfer = false
+        }
+    }
+
 
     private suspend fun runLeader() {
         logger.info("entering candidate state: node={}", localPeer)
@@ -325,23 +463,84 @@ class Raft<T, E, R> private constructor(
         // defer below runs, but this makes sure we always notify the same chan if
         // ever for both gaining and loosing leadership.
         val notify = notifyCh
-        notify?.send(true)
+        if (notify != null) {
+            select<Unit> {
+                notify.onSend(true) {}
+                shutdownCh.onReceive {}
+            }
+        }
 
         // setup leader state. This is only supposed to be accessed within the
         // leaderloop.
         setupLeadershipState()
         try {
+            // Start a replication routine for each peer
+            startStopReplication()
+
             // Dispatch a no-op log entry first. This gets this leader up to the latest
             // possible commit index, even in the absence of client commands. This used
             // to append a configuration entry instead of a noop. However, that permits
             // an unbounded number of uncommitted configurations in the log. We now
             // maintain that there exists at most one uncommitted configuration entry in
             // any log, so we have to do proper no-ops here.
-            dispatchLogs(listOf(Log.Data.Nop))
+            dispatchLogs(listOf(LogFuture()), listOf(Log.Data.Noop))
             leaderLoop()
         } finally {
-            cleanupRunLeader()
+            cleanupRunLeader(notify)
         }
+    }
+
+    /**
+     *  startStopReplication will set up state and start asynchronous replication to
+     *  new peers, and stop replication to removed peers. Before removing a peer,
+     *  it'll instruct the replication routines to try to replicate to the current
+     *  index. This must only be called from the main thread.
+     */
+    private suspend fun startStopReplication() {
+        val inConfig = mutableMapOf<ServerId, Boolean>()
+        var lastIdx = raftState.getLastIndex()
+
+        for (server in configurations.latest.servers) {
+            if (server.peer.id == localPeer.id) continue
+            inConfig[server.peer.id] = true
+            var s = leaderState!!.replState[server.peer.id]
+            if (s == null) {
+                s = FollowerReplication(
+                    serverPeer = server,
+                    commitment = leaderState!!.commitment,
+                    stopCh = Channel(1),
+                    triggerCh = Channel(1),
+                    triggerDeferErrorCh = Channel(1),
+                    currentTerm = raftState.getCurrentTerm(),
+                    nextIndex = lastIdx,
+                    lastContact = clock.now(),
+                    notify = mutableSetOf(),
+                    notifyCh = Channel(1),
+                    stepDown = leaderState!!.stepDown
+                )
+                leaderState!!.replState[server.peer.id] = s
+                scope.launch { replicate(s) }
+            } else if (s.serverPeer != server) {
+                logger.info("updating peer, peer={}", s.serverPeer)
+                s.serverPeer = server
+            }
+        }
+
+        // Stop replication goroutines that need stopping
+        for ((serverId, repl) in leaderState!!.replState.entries.toList()) {
+            if (inConfig.containsKey(serverId)) continue
+            logger.info("removed peer, stopping replication, peer={}, last-index={}", serverId, lastIdx)
+            repl.stopCh.send(lastIdx)
+            repl.stopCh.close()
+            leaderState!!.replState.remove(serverId)
+            observers.observe(Observation.PeerObservation(repl.serverPeer, true))
+        }
+
+    }
+
+    private fun replicate(s: FollowerReplication) {
+
+
     }
 
     private suspend fun leaderLoop() {
@@ -354,28 +553,28 @@ class Raft<T, E, R> private constructor(
         var stepDown = false
         // This is only used for the first lease check, we reload lease below
         // based on the current config value.
-        var lease = config.value.leaderLeaseTimeout
-
         val cleanup = mutableListOf<() -> Unit>()
 
         try {
             coroutineScope {
-                val leaseChanel = Channel<Any>()
-                withTimeout(config.value.electionTimeout) {
-                    leaseChanel.send(true)
-                }
+                var lease = Channel<Unit>().also { fixedTimeout(it, config.value.electionTimeout) }
                 while (isActive && raftState.getState() == LEADER) {
                     select<Unit> {
                         rpcCh.onReceive { processRpc(it) }
                         leaderState!!.stepDown.onReceive { raftState.setState(FOLLOWER) }
-                        leadershipTransferCh.onReceive { lt ->
+                        leadershipTransferCh.onReceive { future ->
                             if (leaderState!!.leadershipTransferInProgress.value) {
-                                lt.response.completeExceptionally(RaftError.ErrLeadershipTransferInProgress)
+                                logger.debug("(leadershipTransfer) leadership transfer in progress, aborting")
+                                future.respond(ErrLeadershipTransferInProgress)
                                 return@onReceive
                             }
-                            val req = lt.request!!
-                            logger.debug("starting leadership transfer, id={}, address={}", req.id, req.address)
-                            val leftLeaderLoop = Channel<Any>()
+                            val newPeer = future.peer
+                            logger.debug(
+                                "starting leadership transfer, id={}, address={}",
+                                newPeer?.id,
+                                newPeer?.address
+                            )
+                            val leftLeaderLoop = Channel<Unit>()
                             cleanup += { leftLeaderLoop.close() }
                             val stopCh = Channel<Unit>()
                             val doneCh = Channel<RaftError?>(1)
@@ -387,21 +586,24 @@ class Raft<T, E, R> private constructor(
                             // The leadershipTransfer function is controlled with
                             // the stopCh and doneCh.
                             launch {
-                                withTimeout(config.value.electionTimeout) {
-                                    stopCh.close()
-                                    lt.response.completeExceptionally(RaftError.ErrLeadershipTransferTimeout)
-                                    logger.debug("leadership transfer timeout")
-                                    doneCh.send(RaftError.ErrLeadershipTransferTimeout)
-                                }
                                 select<Unit> {
-                                    leftLeaderLoop.onReceiveCatching {
+                                    onTimeout(config.value.electionTimeout) {
                                         stopCh.close()
-                                        lt.response.completeExceptionally(RaftError.ErrLeadershipTransferLost)
-                                        logger.debug("lost leadership during transfer (expected)")
-                                        doneCh.send(RaftError.ErrLeadershipTransferLost)
+                                        logger.debug("leadership transfer timeout")
+                                        future.respond(ErrLeadershipTransferTimeout)
+                                        doneCh.send(null)
                                     }
-                                    doneCh.onReceiveCatching {
-                                        lt.respond { }
+                                    leftLeaderLoop.onReceive {
+                                        stopCh.close()
+                                        logger.debug("lost leadership during transfer (expected)")
+                                        future.respond(null)
+                                        doneCh.send(null)
+                                    }
+                                    doneCh.onReceive {
+                                        if (it != null) {
+                                            logger.debug("doneCh: {}", it)
+                                        }
+                                        future.respond(it)
                                     }
                                 }
                             }
@@ -410,24 +612,24 @@ class Raft<T, E, R> private constructor(
                             // starting leadership transfer asynchronously because
                             // leaderState is only supposed to be accessed in the
                             // leaderloop.
-                            val peer = lt.request.run { pickServer()?.peer }
-                            if (peer == null) {
+
+                            val transferPeer = newPeer?.run { pickServer()?.peer }
+                            if (transferPeer == null) {
                                 logger.error("cannot find peer")
-                                doneCh.send(RaftError.ErrCannotFindPeer)
+                                doneCh.send(ErrCannotFindPeer)
                                 return@onReceive
                             }
-                            val state = leaderState!!.replState[peer.id]
+                            val state = leaderState!!.replState[transferPeer.id]
                             if (state == null) {
-                                logger.error("cannot find replication state for {}", peer.id)
-                                doneCh.send(RaftError.Unspecified("cannot find replication state for $peer.id"))
+                                logger.error("cannot find replication state for {}", transferPeer.id)
+                                doneCh.send(Unspecified("cannot find replication state for $transferPeer.id"))
                                 return@onReceive
                             }
                             launch {
-                                leadershipTransfer(peer, state, stopCh, doneCh)
+                                leadershipTransfer(transferPeer, state, stopCh, doneCh)
                             }
                         }
-
-                        leaderState!!.commitCh.onReceiveCatching {
+                        leaderState!!.commitCh.onReceive {
                             // Process the newly committed entries
                             val oldCommitIndex = raftState.getCommitIndex()
                             val commitIndex = leaderState!!.commitment.getCommitIndex()
@@ -444,10 +646,12 @@ class Raft<T, E, R> private constructor(
                                 }
                             }
 
-                            val groupFutures = mutableMapOf<Long, Message<Log, R?>>()
+                            val groupFutures = LinkedHashMap<Long, LogFuture<R>>()
                             var lastIdxGroup: Long = 0
+
+                            // Pull all inflight logs that are committed off the queue.
                             for (commitLog in leaderState!!.inflight) {
-                                val idx = commitLog.request.position.index
+                                val idx = commitLog.log!!.position.index
                                 if (idx > commitIndex) {
                                     // Don't go past the committed index
                                     break
@@ -471,35 +675,94 @@ class Raft<T, E, R> private constructor(
                                 }
                             }
                         }
-
-                        verifyCh.onReceive { r: Message<Verify, Unit> ->
-                            val v = r.request
+                        verifyCh.onReceive { v: VerifyFuture ->
                             when {
                                 v.quorumSize == 0 -> {
                                     // Just dispatched, start the verification
-                                    verifyLeader(r)
+                                    verifyLeader(v)
                                 }
                                 v.votes < v.quorumSize -> {
                                     // Early return, means there must be a new leader
                                     logger.warn("new leader elected, stepping down")
                                     raftState.setState(FOLLOWER)
-                                    leaderState!!.notify.remove(r)
-                                    leaderState!!.replState.forEach { (_, _) ->
-//                                        state.cleanupNotify(v)
+                                    leaderState!!.notify.remove(v)
+                                    leaderState!!.replState.forEach { (_, repl) ->
+                                        repl.cleanupNotify(v)
                                     }
-                                    r.response.completeExceptionally(RaftError.ErrNotLeader)
+                                    v.respond(ErrNotLeader)
                                 }
                                 else -> {
                                     // Quorum of members agree, we are still leader
-                                    leaderState!!.notify.remove(r)
-                                    leaderState!!.replState.forEach { (_, _) ->
-//                                        state.cleanupNotify(v)
+                                    leaderState!!.notify.remove(v)
+                                    leaderState!!.replState.forEach { (_, repl) ->
+                                        repl.cleanupNotify(v)
                                     }
-                                    r.respond { }
+                                    v.respond(null)
                                 }
                             }
                         }
-
+                        userRestoreCh.onReceive { future ->
+                            if (leaderState!!.leadershipTransferInProgress.value) {
+                                logger.debug("(userRestore) leadership transfer in progress, aborting")
+                                future.respond(ErrLeadershipTransferInProgress)
+                                return@onReceive
+                            }
+                            try {
+                                restoreUserSnapshot(future.meta, future.reader)
+                            } catch (e: Exception) {
+                                future.respond(Unspecified(e))
+                            }
+                        }
+                        configurationsCh.onReceive { future ->
+                            if (leaderState!!.leadershipTransferInProgress.value) {
+                                logger.debug("(configurations) leadership transfer in progress, aborting")
+                                future.respond(ErrLeadershipTransferInProgress)
+                                return@onReceive
+                            }
+                            future.configurations = configurations
+                            future.respond(null)
+                        }
+                        configurationChangeChIfStable()?.onReceive { future ->
+                            if (leaderState!!.leadershipTransferInProgress.value) {
+                                logger.debug("(configurationChangeChIfStable) leadership transfer in progress, aborting")
+                                future.respond(ErrLeadershipTransferInProgress)
+                                return@onReceive
+                            }
+                            appendConfigurationEntry(future)
+                        }
+                        bootstrapCh.onReceive { b -> b.respond(ErrCantBootstrap) }
+                        applyCh.onReceive { newLog ->
+                            if (leaderState!!.leadershipTransferInProgress.value) {
+                                logger.debug("(apply) leadership transfer in progress, aborting")
+                                newLog.respond(ErrLeadershipTransferInProgress)
+                                return@onReceive
+                            }
+                            // Group commit, gather all the ready commits
+                            val ready = mutableListOf(newLog)
+                            for (i in 1..config.value.maxAppendEntries) {
+                                val more = applyCh.tryReceive()
+                                if (more.isSuccess) {
+                                    ready.add(more.getOrThrow())
+                                } else {
+                                    break
+                                }
+                            }
+                            // Dispatch the logs
+                            if (stepDown) {
+                                ready.forEach { it.respond(ErrNotLeader) }
+                            } else {
+                                dispatchLogs(ready, ready.map { it.log!!.data })
+                            }
+                        }
+                        lease.onReceive {
+                            // Check if we've exceeded the lease, potentially stepping down
+                            val maxDiff = checkLeaderLease()
+                            // Next check interval should adjust for the last node we've
+                            // contacted, without going negative
+                            val checkInterval = maxOf(minCheckInterval, config.value.leaderLeaseTimeout - maxDiff)
+                            fixedTimeout(lease, checkInterval)
+                        }
+                        shutdownCh.onReceive { }
                     }
                 }
             }
@@ -508,61 +771,144 @@ class Raft<T, E, R> private constructor(
         }
     }
 
+    /**
+     * checkLeaderLease is used to check if we can contact a quorum of nodes
+     * within the last leader lease interval. If not, we need to step down,
+     * as we may have lost connectivity. Returns the maximum duration without
+     * contact. This must only be called from the main thread.
+     */
+    private fun checkLeaderLease(): Duration {
+        var contacted = 0
+        val leaseTimeout = config.value.leaderLeaseTimeout
+        var maxDiff: Duration = ZERO
+        val now = clock.now()
+        for (server in configurations.latest.servers) {
+            if (server.suffrage == VOTER) {
+                if (server.peer.id == localPeer.id) {
+                    contacted++
+                    continue
+                }
+                val f = leaderState!!.replState[server.peer.id]!!
+                val diff = now - f.lastContact.value
+                if (diff <= leaseTimeout) {
+                    contacted++
+                    if (diff > maxDiff) {
+                        maxDiff = diff
+                    }
+                } else {
+                    // Log at least once at high value, then debug. Otherwise it gets very verbose.
+                    if (diff <= leaseTimeout * 3) {
+                        logger.warn("failed to contact, server-id={}, time={}", server.serverId, diff)
+                    } else {
+                        logger.debug("failed to contact, server-id={}, time={}", server.serverId, diff)
+                    }
+                }
+            }
+        }
+        val quorum = quorumSize()
+        if (contacted < quorum) {
+            logger.warn("failed to contact quorum of nodes, stepping down")
+            raftState.setState(FOLLOWER)
+        }
+        return maxDiff
+    }
+
+    private suspend fun appendConfigurationEntry(future: ConfigurationChangeFuture<R>) {
+        val configuration = try {
+            configurations.latest.next(configurations.latestIndex, future.req)
+        } catch (e: Exception) {
+            future.respond(Unspecified(e))
+            return
+        }
+        logger.info(
+            "Updating configuration, command={}, server-id={}, server-addr={}, servers={}",
+            future.req.command,
+            future.req.serverId,
+            future.req.serverAddress,
+            configuration.servers
+        )
+        val data = Log.Data.Configuration(configuration)
+
+        dispatchLogs(listOf(future), listOf(data))
+        val index = future.log!!.position.index
+        configurations = configurations.copy(latest = configuration, latestIndex = index)
+        leaderState!!.commitment.setConfiguration(configuration)
+        startStopReplication()
+    }
+
+    private fun restoreUserSnapshot(meta: SnapshotMeta?, reader: Reader?) {
+        TODO("Not yet implemented")
+    }
+
     // verifyLeader must be called from the main thread for safety.
     // Causes the followers to attempt an immediate heartbeat.
 
-    private suspend fun verifyLeader(m: Message<Verify, Unit>) {
-        val v = m.request
+    private suspend fun verifyLeader(v: VerifyFuture) {
         // Current leader always votes for self
         v.votes = 1
         // Set the quorum size, hot-path for single node
         v.quorumSize = quorumSize()
         if (v.quorumSize == 1) {
-            m.respond { }
+            v.respond(null)
             return
         }
-//        leaderState!!.notify.add(m.request)
+        // Track this request
+        v.notifyCh = verifyCh
+        leaderState!!.notify.add(v)
+        leaderState!!.replState.forEach { (_, repl) ->
+            repl.notifyLock.withLock {
+                repl.notify.add(v)
+            }
+            repl.notify
+        }
 
 
     }
 
-    private suspend fun shutdownFn() = shutdownMutex.withLock {
+    private suspend fun shutdownFn() = shutdownLock.withLock {
         if (!shutdown) {
+            shutdownCh.close()
             shutdown = true
             raftState.setState(SHUTDOWN)
-            throw CancellationException("shutting down")
+            ShutdownFuture(this)
+        } else {
+            ShutdownFuture(null)
         }
     }
 
     private suspend fun leadershipTransfer(
         peer: Peer,
-        state: FollowerReplication,
+        repl: FollowerReplication,
         stopCh: Channel<Unit>,
         doneCh: Channel<RaftError?>
     ) {
 
-        if (!stopCh.isEmpty) {
-            stopCh.receiveCatching()
-            return
+        if (stopCh.tryReceive().isSuccess) {
+            doneCh.send(null)
         }
+
         try {
             // Step 1: set this field which stops this leader from responding to any client requests.
             leaderState!!.leadershipTransferInProgress.value = true
 
-            while (state.nextIndex.value <= raftState.getLastIndex()) {
-                val err = Message<Unit, Unit>(Unit)
-                state.triggerDeferErrorCh.send(err)
-                try {
-                    select<Unit> {
-                        err.response.onAwait {}
-                        stopCh.onReceive {
-                            doneCh.send(null)
-                        }
+
+            while (repl.nextIndex.value <= raftState.getLastIndex()) {
+                val err = DeferError()
+                err.init()
+                repl.triggerDeferErrorCh.send(err)
+                val ret = select<Boolean> {
+                    err.errChan.onReceive { err ->
+                        if (err != null) {
+                            doneCh.send(err)
+                            true
+                        } else false
                     }
-                } catch (e: Exception) {
-                    doneCh.send(RaftError.GeneralException(e))
-                    break
+                    stopCh.onReceive {
+                        doneCh.send(null)
+                        true
+                    }
                 }
+                if (ret) return
             }
 
             // Step ?: the thesis describes in chap 6.4.1: Using clocks to reduce
@@ -579,7 +925,7 @@ class Raft<T, E, R> private constructor(
                 transport.timoutNow(peer)
                 doneCh.send(null)
             } catch (e: Exception) {
-                doneCh.send(RaftError.GeneralException(e))
+                doneCh.send(Unspecified(e))
             }
         } finally {
             leaderState!!.leadershipTransferInProgress.value = false
@@ -603,35 +949,42 @@ class Raft<T, E, R> private constructor(
         return pick
     }
 
-    private suspend fun dispatchLogs(applyLogs: List<Log.Data>): List<Message<Log, R?>> {
+    private suspend fun dispatchLogs(applyLogs: List<LogFuture<R>>, logData: List<Log.Data>) {
+        check(applyLogs.size == logData.size) {
+            "(applyLogs.size) ${applyLogs.size} != logData.size (${logData.size}) "
+        }
+
+        val now = clock.now()
         val term = raftState.getCurrentTerm()
         var lastIndex = raftState.getLastIndex()
-        val now = clock.now()
 
-        val logList = applyLogs.map {
+        val logsList = applyLogs.zip(logData).map { (future, data) ->
             lastIndex++
-            Log(Position(term, lastIndex), now, it)
+            Log(Position(term, lastIndex), now, data).also {
+                future.log = it
+                leaderState!!.inflight.add(future)
+            }
         }
-        val messageList = logList.map { Message<Log, R?>(it) }
-        leaderState!!.inflight.addAll(messageList)
+
         try {
-            logs.storeLogs(logList.asSequence())
+            logs.storeLogs(logsList.asSequence())
         } catch (e: Exception) {
             logger.error("failed to commit logs", e)
-            messageList.forEach { it.response.completeExceptionally(e) }
+            applyLogs.forEach { it.respond(Unspecified("failed to commit logs")) }
+            raftState.setState(FOLLOWER)
         }
         leaderState!!.commitment.match(localId, lastIndex)
+
         // Update the last log since it's on disk now
-        raftState.setLastLog(Position(term, lastIndex))
+        raftState.setLastLog(logsList.lastOrNull()?.position ?: Position(term, lastIndex))
+
         // Notify the replicators of the new log
-        leaderState!!.replState.forEach { (_, _) ->
-            // TODO
-            // 		asyncNotifyCh(f.triggerCh)
+        leaderState!!.replState.forEach { (_, f) ->
+            f.triggerCh.asyncNotifyCh()
         }
-        return messageList
     }
 
-    private suspend fun cleanupRunLeader() {
+    private suspend fun cleanupRunLeader(notify: Channel<Boolean>?) {
         // Since we were the leader previously, we update our
         // last contact time when we step down, so that we are not
         // reporting a last contact time from before we were the
@@ -639,14 +992,11 @@ class Raft<T, E, R> private constructor(
         // is extremely stale.
         setLastContact()
 
-        leaderState!!.inflight.forEach {
-            it.response.completeExceptionally(RaftError.ErrLeadershipLost)
-        }
+        // Respond to any pending verify requests
+        leaderState!!.inflight.forEach { it.respond(ErrLeadershipLost) }
 
         // Respond to any pending verify requests
-//        leaderState!!.notify.consumeEach {
-//            it.response.completeExceptionally(Error.ErrLeadershipLost)
-//        }
+        leaderState!!.notify.forEach { it.respond(ErrLeadershipLost) }
 
         // Clear all the state
         leaderState = null
@@ -659,8 +1009,14 @@ class Raft<T, E, R> private constructor(
         }
         leaderCh.overrideNotify(false)
 
-        if (notifyCh != null) {
-            notifyCh!!.trySend(false)
+        if (notify != null) {
+            select<Unit> {
+                notify.onSend(false) {}
+                shutdownCh.onReceive {
+                    // On shutdown, make a best effort but do not block
+                    notify.trySend(false)
+                }
+            }
         }
     }
 
@@ -668,6 +1024,7 @@ class Raft<T, E, R> private constructor(
     private suspend fun setupLeadershipState() {
         val commitCh = Channel<Unit>(1)
         leaderState = LeaderState(
+            commitCh = commitCh,
             commitment = Commitment(
                 commitCh,
                 configurations.latest,
@@ -675,67 +1032,11 @@ class Raft<T, E, R> private constructor(
             ),
             inflight = mutableListOf(),
             replState = mutableMapOf(),
-            notify = mutableSetOf<Message<Verify, Unit>>(),
+            notify = mutableSetOf(),
             stepDown = Channel(1),
-            commitCh = commitCh
         )
     }
 
-
-    private suspend fun runCandidate() {
-        logger.info("entering candidate state: node={}, term={}", localPeer, raftState.getCurrentTerm() + 1)
-        val voteCh = electSelf()
-        coroutineScope {
-            val electionTimer = Channel<Unit>()
-            randomTimeout(electionTimer, config.value.electionTimeout)
-            // Tally the votes, need a simple majority
-            var grantedVotes = 0
-            val votesNeeded = quorumSize()
-            logger.debug("votes, needed={}", votesNeeded)
-            while (isActive && raftState.getState() == CANDIDATE) {
-                select<Unit> {
-                    rpcCh.onReceive { processRpc(it) }
-                    voteCh.onReceive { (peer, vote) ->
-                        // Check if the term is greater than ours, bail
-                        if (vote.term > raftState.getCurrentTerm()) {
-                            logger.debug("newer term discovered, fallback to follower, vote={}", vote)
-                            raftState.setState(FOLLOWER)
-                            raftState.setCurrentTerm(vote.term)
-                            throw CancellationException("new term")
-                        }
-                        // Check if the vote is granted
-                        if (vote.granted) {
-                            grantedVotes++
-                            logger.debug("vote granted, from={}, term={}, tally={}", peer, vote.term, grantedVotes)
-                        }
-                        // Check if we've become the leader
-                        if (grantedVotes >= votesNeeded) {
-                            logger.info("election won, tally={}", grantedVotes)
-                            raftState.setState(LEADER)
-                            setLeader(localPeer)
-                        }
-                    }
-                    configurationChangeCh.onReceive(::respondNotLeader)
-                    applyCh.onReceive(::respondNotLeader)
-                    verifyCh.onReceive(::respondNotLeader)
-                    userRestoreCh.onReceive(::respondNotLeader)
-                    leadershipTransferCh.onReceive(::respondNotLeader)
-                    configurationsCh.onReceive { it.respond { configurations } }
-                    bootstrapCh.onReceive(::respondCannotBootstrap)
-                    electionTimer.onReceive {
-                        logger.warn("Election timeout reached, restarting election")
-                        throw CancellationException("election timeout")
-                    }
-                }
-            }
-        }
-        // Make sure the leadership transfer flag is reset after each run. Having this
-        // flag will set the field LeadershipTransfer in a RequestVoteRequest to true,
-        // which will make other servers vote even though they have a leader already.
-        // It is important to reset that flag, because this privilege could be abused
-        // otherwise.
-        candidateFromLeadershipTransfer = false
-    }
 
     private val localPeer = Peer(localId, localAddr)
 
@@ -799,44 +1100,6 @@ class Raft<T, E, R> private constructor(
         }
     }
 
-    private suspend fun runFollower() {
-        logger.info("entering follower state: follower={}, leader={}", localPeer, this.leader.value)
-        coroutineScope {
-            val heartbeatTimer = Channel<Unit>()
-            randomTimeout(heartbeatTimer, config.value.heartbeatTimeout)
-            while (isActive && raftState.getState() == FOLLOWER) {
-                select<Unit> {
-                    rpcCh.onReceive { processRpc(it) }
-                    configurationChangeCh.onReceive(::respondNotLeader)
-                    applyCh.onReceive(::respondNotLeader)
-                    verifyCh.onReceive(::respondNotLeader)
-                    userRestoreCh.onReceive(::respondNotLeader)
-                    leadershipTransferCh.onReceive(::respondNotLeader)
-                    configurationsCh.onReceive { it.respond { configurations } }
-                    bootstrapCh.onReceive { it.respond { liveBootstrap(it.request) } }
-                    heartbeatTimer.onReceive {
-                        val hbTimeout = config.value.heartbeatTimeout
-                        randomTimeout(heartbeatTimer, hbTimeout)
-                        if (clock.now().minus(lastContact.value) >= hbTimeout) {
-                            val lastLeader = setLeader(null)
-                            if (configurations.latestIndex == 0L) {
-                                logger.warn("no known peers, aborting election")
-                            } else if (configurations.latestIndex == configurations.committedIndex
-                                && !configurations.latest.hasVote(localId)
-                            ) {
-                                logger.warn("not part of stable configuration, aborting election")
-                            } else {
-                                logger.warn("heartbeat timeout reached, starting election, last-leader={}", lastLeader)
-                                raftState.setState(CANDIDATE)
-                                cancel("heartbeat timeout reached, starting election")
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     private fun setLeader(newLeader: Peer?): Peer? {
         val oldLeader = leader.getAndUpdate {
             newLeader
@@ -872,7 +1135,7 @@ class Raft<T, E, R> private constructor(
             checkRpcHeader(message.request.header)
             when (message.request) {
                 is Rpc.AppendEntriesRequest -> appendEntries(message.request)
-                else -> throw RaftError.ErrUnexpectedRequest(message.request)
+                else -> throw ErrUnexpectedRequest(message.request)
             }
         }
     }
@@ -968,10 +1231,6 @@ class Raft<T, E, R> private constructor(
     private suspend fun persistVote(term: Long, candidate: Peer) {
         stable.set(Key.LAST_VOTE_TERM, term)
         stable.set(Key.LAST_VOTE_CAND, candidate)
-    }
-
-    private fun <U> deserialize(lastVoteCandBytes: ByteArray): U {
-        TODO("Not yet implemented")
     }
 
     private suspend fun installSnapshot(request: Rpc.InstallSnapshotRequest): Rpc.InstallSnapshotResponse {
@@ -1107,7 +1366,7 @@ class Raft<T, E, R> private constructor(
      * time, and always pass [futures]=nil. Leaders call this when entries are committed. They pass the futures from any
      * inflight logs.
      */
-    private suspend fun processLogs(index: Long, futures: Map<Long, Message<Log, R?>>) {
+    private suspend fun processLogs(index: Long, futures: Map<Long, LogFuture<R>>) {
         val lastApplied = raftState.getLastApplied()
         if (index <= lastApplied) {
             logger.warn("skipping application of old log: index={}", index)
@@ -1116,40 +1375,50 @@ class Raft<T, E, R> private constructor(
         // Store maxAppendEntries for this call in case it ever becomes reloadable. We need to use the same value for
         // all lines here to get the expected result.
         val maxAppendEntries = config.value.maxAppendEntries
+        val batch = mutableListOf<CommitTuple<R>>()
 
-        val batch = mutableListOf<Message<Log, R?>>()
         for (idx in (lastApplied + 1)..index) {
             val future = futures[idx]
-            val preparedLog: Message<Log, R?> = if (future == null) {
-                val log = logs.getLog(idx) ?: throw IllegalStateException("failed to get log, index=${idx}")
-                Message(log)
+            val preparedLog = if (future != null) {
+                prepareLog(future.log!!, future)
             } else {
-                if (future.request.data is Log.Data.Nop) {
-                    future.response.complete(null)
-                    continue
-                }
-                future
+                val log = logs.getLog(idx)
+                check(log != null) { "failed to get log index=$idx" }
+                prepareLog(log, null)
             }
-            // If we have a log ready to send to the FSM add it to the batch.
-            // The FSM thread will respond to the future.
-            batch.add(preparedLog)
-            if (batch.size >= maxAppendEntries) {
-                // If we have filled up a batch, send it to the FSM
-                applyBatch(batch)
-                batch.clear()
+            when {
+                preparedLog != null -> {
+                    batch.add(preparedLog)
+                    if (batch.size >= maxAppendEntries) {
+                        applyBatch(batch)
+                        batch.clear()
+                    }
+                }
+                future != null -> future.respond(null) // Invoke the future if given. (Noop)
             }
         }
         // If there are any remaining logs in the batch apply them
-        if (batch.size > 0) applyBatch(batch)
+        if (batch.size != 0) applyBatch(batch)
+
+        // Update the lastApplied index and term
         raftState.setLastApplied(index)
     }
 
-    private suspend fun applyBatch(batch: List<Message<Log, R?>>) {
-        try {
-            fsmMutateCh.send(batch.asSequence())
-        } catch (e: CancellationException) {
-            batch.forEach { message -> message.response.completeExceptionally(RaftError.ErrRaftShutdown) }
-            throw e
+    private fun prepareLog(log: Log, future: LogFuture<R>?): CommitTuple<R>? {
+        return when (log.data) {
+            is Log.Data.Noop -> null
+            is Log.Data.Barrier, is Log.Data.Command<*>, is Log.Data.Configuration -> {
+                CommitTuple(log, future)
+            }
+        }
+    }
+
+    private suspend fun applyBatch(batch: List<CommitTuple<R>>) {
+        select<Unit> {
+            fsmMutateCh.onSend(batch) {}
+            shutdownCh.onReceive {
+                batch.forEach { cl -> cl.future?.respond(ErrRaftShutdown) }
+            }
         }
     }
 
@@ -1159,16 +1428,16 @@ class Raft<T, E, R> private constructor(
 
     private fun checkRpcHeader(header: RpcHeader) {
         if (header.protocolVersion != ProtocolVersion.VERSION_3) {
-            throw RaftError.ErrUnsupportedProtocol
+            throw ErrUnsupportedProtocol
         }
     }
 
-    private fun respondNotLeader(message: Message<*, *>) {
-        message.response.completeExceptionally(RaftError.ErrNotLeader)
+    private suspend fun respondNotLeader(future: DeferError) {
+        future.respond(ErrNotLeader)
     }
 
-    private fun respondCannotBootstrap(message: Message<Configuration, Unit>) {
-        message.response.completeExceptionally(RaftError.ErrCantBootstrap)
+    private suspend fun respondCannotBootstrap(future: DeferError) {
+        future.respond(ErrCantBootstrap)
     }
 
     suspend fun waitShutdown() {
@@ -1181,12 +1450,36 @@ class Raft<T, E, R> private constructor(
         }
     }
 
+    // configurationChangeChIfStable returns r.configurationChangeCh if it's safe
+    // to process requests from it, or nil otherwise. This must only be called
+    // from the main thread.
+    //
+    // Note that if the conditions here were to change outside of leaderLoop to take
+    // this from nil to non-nil, we would need leaderLoop to be kicked.
+    fun configurationChangeChIfStable() =
+    // Have to wait until:
+    // 1. The latest configuration is committed, and
+    // 2. This leader has committed some entry (the noop) in this term
+        //    https://groups.google.com/forum/#!msg/raft-dev/t4xj6dJTP6E/d2D9LrWRza8J
+        if (configurations.latestIndex == configurations.committedIndex &&
+            raftState.getCommitIndex() >= leaderState!!.commitment.startIndex
+        ) {
+            configurationChangeCh
+        } else {
+            null
+        }
 }
 
 
-data class VoterResponse(val peer: Peer, val peerResponse: Rpc.RequestVoteResponse)
+data class VoterResponse(
+    val peer: Peer,
+    val peerResponse: Rpc.RequestVoteResponse
+)
+
 data class Verify(
     var quorumSize: Int,
     var votes: Int,
     val voteLock: Mutex = Mutex()
 )
+
+data class CommitTuple<R>(val log: Log, val future: LogFuture<R>?)

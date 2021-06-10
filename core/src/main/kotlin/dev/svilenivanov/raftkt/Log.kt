@@ -24,10 +24,10 @@ data class Log(
         ) : Data()
 
         @Serializable
-        object Nop : Data()
+        object Noop : Data()
 
         @Serializable
-        object Barrie : Data()
+        object Barrier : Data()
 
         @Serializable
         data class Configuration(

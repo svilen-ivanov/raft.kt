@@ -35,7 +35,7 @@ data class Message<REQ, RES>(
     }
 }
 
-private fun calcRandomTimeout(timeout: Duration): Duration {
+internal fun calcRandomTimeout(timeout: Duration): Duration {
     return Duration.milliseconds(timeout.inWholeMilliseconds + Random.nextLong(timeout.inWholeMilliseconds))
 }
 

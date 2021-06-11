@@ -4,8 +4,10 @@ package dev.svilenivanov.raftkt
 
 import dev.svilenivanov.raftkt.Observation.LeaderObservation
 import dev.svilenivanov.raftkt.RaftError.*
+import dev.svilenivanov.raftkt.ReplicateStateMachine.*
 import dev.svilenivanov.raftkt.ServerSuffrage.VOTER
 import dev.svilenivanov.raftkt.State.*
+import kotlinx.atomicfu.AtomicLong
 import kotlinx.atomicfu.atomic
 import kotlinx.atomicfu.getAndUpdate
 import kotlinx.atomicfu.update
@@ -516,7 +518,8 @@ class Raft<T, E, R> private constructor(
                     lastContact = clock.now(),
                     notify = mutableSetOf(),
                     notifyCh = Channel(1),
-                    stepDown = leaderState!!.stepDown
+                    stepDown = leaderState!!.stepDown,
+                    clock = clock
                 )
                 leaderState!!.replState[server.peer.id] = s
                 scope.launch { replicate(s) }
@@ -538,9 +541,280 @@ class Raft<T, E, R> private constructor(
 
     }
 
-    private fun replicate(s: FollowerReplication) {
+    /**
+     * replicate is a long running routine that replicates log entries to a single
+     * follower.
+     */
+    private suspend fun replicate(s: FollowerReplication) {
+        // Start an async heartbeating routing
+        val stopHeartbeat = Channel<Unit>()
+        try {
+            scope.launch { heartbeat(s, stopHeartbeat) }
+
+            var sm: ReplicateStateMachine = RPC
+            SM@ while (true) when (sm) {
+                is RPC -> {
+                    var shouldStop = false
+                    while (!shouldStop) {
+                        val done = select<Boolean> {
+                            s.stopCh.onReceive { maxIndex ->
+                                if (maxIndex > 0) {
+                                    replicateTo(s, maxIndex)
+                                }
+                                true
+                            }
+                            s.triggerDeferErrorCh.onReceive { deferErr ->
+                                val lastLogIdx = raftState.getLastLog().index
+                                shouldStop = replicateTo(s, lastLogIdx)
+                                if (!shouldStop) {
+                                    deferErr.respond(null)
+                                } else {
+                                    deferErr.respond(Unspecified("replication failed"))
+                                }
+                                false
+                            }
+                            s.triggerCh.onReceive {
+                                val lastLogIdx = raftState.getLastLog().index
+                                shouldStop = replicateTo(s, lastLogIdx)
+                                false
+                            }
+                            // This is _not_ our heartbeat mechanism but is to ensure
+                            // followers quickly learn the leader's commit index when
+                            // raft commits stop flowing naturally. The actual heartbeats
+                            // can't do this to keep them unblocked by disk IO on the
+                            // follower. See https://github.com/hashicorp/raft/issues/282.
+                            onTimeout(calcRandomTimeout(config.value.commitTimeout)) {
+                                val lastLogIdx = raftState.getLastLog().index
+                                shouldStop = replicateTo(s, lastLogIdx)
+                                false
+                            }
+                        }
+                        if (done) return
+                        // If things looks healthy, switch to pipeline mode
+                        if (!shouldStop && s.allowPipeline) {
+                            sm = PIPELINE
+                            continue@SM
+                        }
+                    }
+                    return
+                }
+                is PIPELINE -> {
+                    // Disable until re-enabled
+                    s.allowPipeline = false
+                    // Replicates using a pipeline for high performance. This method
+                    // is not able to gracefully recover from errors, and so we fall back
+                    // to standard mode on failure.
+                    try {
+                        pipelineReplicate(s)
+                    } catch (e: ErrPipelineReplicationNotSupported) {
+                        logger.error("failed to start pipeline replication to peer={}", s.serverPeer, e)
+                    } catch (e: Exception) {
+                        logger.error("unexpected pipelineReplicate exception", e)
+                    }
+                    sm = RPC
+                    continue@SM
+                }
+            }
+        } finally {
+            stopHeartbeat.close()
+        }
+    }
+
+    private suspend fun pipelineReplicate(s: FollowerReplication) {
+        // Create a new pipeline
+        var pipeline: AppendPipeline? = null
+        try {
+            pipeline = transport.appendEntriesPipeline(s.serverPeer.peer)
+            // Log start of pipeline
+            logger.info("pipelining replication, peer={}", s.serverPeer.peer)
+
+            // Create a shutdown and finish channel
+            val stopCh = Channel<Unit>()
+            val finishCh = Channel<Unit>()
+
+            // Start a dedicated decoder
+            scope.launch { pipelineDecode(s, pipeline, stopCh, finishCh) }
+
+            // Start pipeline sends at the last good nextIndex
+            val nextIdx = atomic(s.nextIndex.value)
+
+            var shouldStop = false
+            SEND@ while (!shouldStop) {
+                val done = select<Boolean> {
+                    finishCh.onReceive { true }
+                    s.stopCh.onReceive { maxIndex ->
+                        if (maxIndex > 0) {
+                            pipelineSend(s, pipeline, nextIdx, maxIndex)
+                        }
+                        true
+                    }
+                    s.triggerDeferErrorCh.onReceive { deferErr ->
+                        val lastLogIdx = raftState.getLastLog().index
+                        shouldStop = pipelineSend(s, pipeline, nextIdx, lastLogIdx)
+                        if (!shouldStop) {
+                            deferErr.respond(null)
+                        } else {
+                            deferErr.respond(Unspecified("replication failed"))
+                        }
+                        false
+                    }
+                    s.triggerCh.onReceive {
+                        val lastLogIdx = raftState.getLastLog().index
+                        shouldStop = pipelineSend(s, pipeline, nextIdx, lastLogIdx)
+                        false
+                    }
+                    onTimeout(calcRandomTimeout(config.value.commitTimeout)) {
+                        val lastLogIdx = raftState.getLastLog().index
+                        shouldStop = pipelineSend(s, pipeline, nextIdx, lastLogIdx)
+                        false
+                    }
+
+                }
+                if (done) break
+            }
+            stopCh.close()
+            // Stop our decoder, and wait for it to finish
+            select<Unit> {
+                finishCh.onReceive {}
+                shutdownCh.onReceive {}
+            }
+        } finally {
+            pipeline?.close()
+            // Log stop of pipeline
+            logger.info("aborting pipeline replication, peer={}", s.serverPeer.peer)
+        }
+
+    }
+
+    // pipelineSend is used to send data over a pipeline. It is a helper to
+    // pipelineReplicate.
+    private suspend fun pipelineSend(s: FollowerReplication, p: AppendPipeline, nextIdx: AtomicLong, lastIndex: Long): Boolean {
+        return try {
+            val req = setupAppendEntries(s, nextIdx.value, lastIndex)
+            p.appendEntries(req)
+            // Increase the next send log to avoid re-sending old logs
+            req.entries.lastOrNull()?.run {
+                nextIdx.value = position.index + 1
+            }
+            false
+        } catch (e: Exception) {
+            logger.error("failed to pipeline appendEntries", e)
+            true
+        }
+    }
+
+    // pipelineDecode is used to decode the responses of pipelined requests.
+    private suspend fun pipelineDecode(
+        s: FollowerReplication,
+        p: AppendPipeline,
+        stopCh: Channel<Unit>,
+        finishCh: Channel<Unit>
+    ) {
+        try {
+            val respCh = p.consumer
+            while (true) {
+                val ret = select<Boolean> {
+                    respCh.onReceive { ready ->
+                        val (req, response) = ready
+                        // Check for a newer term, stop running
+                        if (response.term > req.term) {
+                            handleStaleTerm(s)
+                            return@onReceive true
+                        }
+                        // Update the last contact
+                        s.setLastContact()
+                        // Abort pipeline if not successful
+                        if (!response.success) {
+                            return@onReceive true
+                        }
+                        updateLastAppended(s, req)
+
+                        false
+                    }
+                    stopCh.onReceive {
+                        true
+                    }
+                }
+                if (ret) return
+            }
+        } finally {
+            finishCh.close()
+        }
+    }
+
+    // setupAppendEntries is used to setup an append entries request.
+    private suspend fun setupAppendEntries(
+        s: FollowerReplication,
+        nextIdx: Long,
+        lastIndex: Long
+    ): Rpc.AppendEntriesRequest {
+        val prevPos = calcPreviousLog(nextIdx)
+        return Rpc.AppendEntriesRequest(
+            header = header,
+            term = s.currentTerm,
+            leader = localPeer,
+            leaderCommitIndex = raftState.getCommitIndex(),
+            prevLogTerm = prevPos.term,
+            prevLogEntry = prevPos.index,
+            entries = newLogs(nextIdx, lastIndex)
+        )
+    }
+
+    // setPreviousLog is used to setup the PrevLogEntry and PrevLogTerm for an
+    // AppendEntriesRequest given the next index to replicate.
+    private suspend fun calcPreviousLog(nextIdx: Long): Position {
+        // Guard for the first index, since there is no 0 log entry
+        // Guard against the previous index being a snapshot as well
+        val lastSnap = raftState.getLastSnapshot()
+        if (nextIdx == 1L) {
+            return RaftState.ZERO_POSITION
+        } else if ((nextIdx - 1) == lastSnap.index) {
+            return lastSnap
+        } else {
+            val getLogIdx = nextIdx - 1
+            val log = logs.getLog(getLogIdx)
+            checkNotNull(log) { "failed to get log, index=${getLogIdx}" }
+            return log.position
+        }
+    }
+
+    // setNewLogs is used to setup the logs which should be appended for a request.
+    private suspend fun newLogs(nextIdx: Long, lastIndex: Long): List<Log> {
+        // Append up to MaxAppendEntries or up to the lastIndex. we need to use a
+        // consistent value for maxAppendEntries in the lines below in case it ever
+        // becomes reloadable.
+        val maxAppendEntries = config.value.maxAppendEntries
+        val maxIndex = minOf(nextIdx + maxAppendEntries - 1, lastIndex)
+        return (nextIdx..maxIndex).map { i -> logs.getLog(i)!! }
+    }
+
+    // handleStaleTerm is used when a follower indicates that we have a stale term.
+    private suspend fun handleStaleTerm(s: FollowerReplication) {
+        logger.error("peer has newer term, stopping replication, peer={}", s.serverPeer.peer)
+        s.notifyAll(false) // No longer leader
+        s.stepDown.asyncNotifyCh()
+    }
+
+    // updateLastAppended is used to update follower replication state after a
+    // successful AppendEntries RPC.
+    // TODO: This isn't used during InstallSnapshot, but the code there is similar.
+
+    private suspend fun updateLastAppended(s: FollowerReplication, req: Rpc.AppendEntriesRequest) {
+        req.entries.lastOrNull()?.run {
+            s.nextIndex.value = position.index + 1
+            s.commitment.match(s.serverPeer.serverId, position.index)
+        }
+        // Notify still leader
+        s.notifyAll(true)
+    }
 
 
+    private fun replicateTo(s: FollowerReplication, maxIndex: Long): Boolean {
+        TODO("Not yet implemented")
+    }
+
+    private fun heartbeat(s: FollowerReplication, stopHeartbeat: Channel<Unit>) {
+        TODO("Not yet implemented")
     }
 
     private suspend fun leaderLoop() {
@@ -557,7 +831,7 @@ class Raft<T, E, R> private constructor(
 
         try {
             coroutineScope {
-                var lease = Channel<Unit>().also { fixedTimeout(it, config.value.electionTimeout) }
+                val lease = Channel<Unit>().also { fixedTimeout(it, config.value.electionTimeout) }
                 while (isActive && raftState.getState() == LEADER) {
                     select<Unit> {
                         rpcCh.onReceive { processRpc(it) }
@@ -1483,3 +1757,9 @@ data class Verify(
 )
 
 data class CommitTuple<R>(val log: Log, val future: LogFuture<R>?)
+
+sealed class ReplicateStateMachine {
+    object RPC : ReplicateStateMachine()
+    object PIPELINE : ReplicateStateMachine()
+}
+

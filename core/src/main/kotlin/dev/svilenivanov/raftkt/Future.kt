@@ -223,4 +223,7 @@ class AppendFuture(
 ) : DeferError() {
     fun request() = args!!
     fun response() = resp!!
+
+    operator fun component1() = request()
+    operator fun component2() = response()
 }

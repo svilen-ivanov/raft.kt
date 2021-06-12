@@ -5,9 +5,9 @@ package dev.svilenivanov.raftkt
 import dev.svilenivanov.raftkt.Observation.LeaderObservation
 import dev.svilenivanov.raftkt.RaftError.*
 import dev.svilenivanov.raftkt.ReplicateStateMachine.*
+import dev.svilenivanov.raftkt.ReplicateToStateMachine.*
 import dev.svilenivanov.raftkt.ServerSuffrage.VOTER
 import dev.svilenivanov.raftkt.State.*
-import kotlinx.atomicfu.AtomicLong
 import kotlinx.atomicfu.atomic
 import kotlinx.atomicfu.getAndUpdate
 import kotlinx.atomicfu.update
@@ -620,77 +620,21 @@ class Raft<T, E, R> private constructor(
         }
     }
 
-    private suspend fun pipelineReplicate(s: FollowerReplication) {
-        // Create a new pipeline
-        var pipeline: AppendPipeline? = null
-        try {
-            pipeline = transport.appendEntriesPipeline(s.serverPeer.peer)
-            // Log start of pipeline
-            logger.info("pipelining replication, peer={}", s.serverPeer.peer)
-
-            // Create a shutdown and finish channel
-            val stopCh = Channel<Unit>()
-            val finishCh = Channel<Unit>()
-
-            // Start a dedicated decoder
-            scope.launch { pipelineDecode(s, pipeline, stopCh, finishCh) }
-
-            // Start pipeline sends at the last good nextIndex
-            val nextIdx = atomic(s.nextIndex.value)
-
-            var shouldStop = false
-            SEND@ while (!shouldStop) {
-                val done = select<Boolean> {
-                    finishCh.onReceive { true }
-                    s.stopCh.onReceive { maxIndex ->
-                        if (maxIndex > 0) {
-                            pipelineSend(s, pipeline, nextIdx, maxIndex)
-                        }
-                        true
-                    }
-                    s.triggerDeferErrorCh.onReceive { deferErr ->
-                        val lastLogIdx = raftState.getLastLog().index
-                        shouldStop = pipelineSend(s, pipeline, nextIdx, lastLogIdx)
-                        if (!shouldStop) {
-                            deferErr.respond(null)
-                        } else {
-                            deferErr.respond(Unspecified("replication failed"))
-                        }
-                        false
-                    }
-                    s.triggerCh.onReceive {
-                        val lastLogIdx = raftState.getLastLog().index
-                        shouldStop = pipelineSend(s, pipeline, nextIdx, lastLogIdx)
-                        false
-                    }
-                    onTimeout(calcRandomTimeout(config.value.commitTimeout)) {
-                        val lastLogIdx = raftState.getLastLog().index
-                        shouldStop = pipelineSend(s, pipeline, nextIdx, lastLogIdx)
-                        false
-                    }
-
-                }
-                if (done) break
-            }
-            stopCh.close()
-            // Stop our decoder, and wait for it to finish
-            select<Unit> {
-                finishCh.onReceive {}
-                shutdownCh.onReceive {}
-            }
-        } finally {
-            pipeline?.close()
-            // Log stop of pipeline
-            logger.info("aborting pipeline replication, peer={}", s.serverPeer.peer)
-        }
-
-    }
 
     // pipelineSend is used to send data over a pipeline. It is a helper to
     // pipelineReplicate.
-    private suspend fun pipelineSend(s: FollowerReplication, p: AppendPipeline, nextIdx: AtomicLong, lastIndex: Long): Boolean {
+    private suspend fun pipelineSend(
+        s: FollowerReplication,
+        p: AppendPipeline,
+        nextIdx: MutableLong,
+        lastIndex: Long
+    ): Boolean {
         return try {
-            val req = setupAppendEntries(s, nextIdx.value, lastIndex)
+            val req = try {
+                setupAppendEntries(s, nextIdx.value, lastIndex)
+            } catch (e: ErrLogNotFound) {
+                return true
+            }
             p.appendEntries(req)
             // Increase the next send log to avoid re-sending old logs
             req.entries.lastOrNull()?.run {
@@ -785,7 +729,7 @@ class Raft<T, E, R> private constructor(
         // becomes reloadable.
         val maxAppendEntries = config.value.maxAppendEntries
         val maxIndex = minOf(nextIdx + maxAppendEntries - 1, lastIndex)
-        return (nextIdx..maxIndex).map { i -> logs.getLog(i)!! }
+        return (nextIdx..maxIndex).map { i -> logs.getLog(i) ?: throw ErrLogNotFound }
     }
 
     // handleStaleTerm is used when a follower indicates that we have a stale term.
@@ -809,12 +753,259 @@ class Raft<T, E, R> private constructor(
     }
 
 
-    private fun replicateTo(s: FollowerReplication, maxIndex: Long): Boolean {
-        TODO("Not yet implemented")
+    // replicateTo is a helper to replicate(), used to replicate the logs up to a
+    // given last index.
+    // If the follower log is behind, we take care to bring them up to date.
+    // Create the base request
+    private suspend fun replicateTo(s: FollowerReplication, lastIndex: Long): Boolean {
+        var sm: ReplicateToStateMachine = START
+        SM@ while (true) when (sm) {
+            is START -> {
+                if (s.failures > 0) {
+                    select<Unit> {
+                        onTimeout(backoff(FAILURE_WAIT, s.failures, MAX_FAILURE_SCALE).inWholeMilliseconds) {}
+                        shutdownCh.onReceive {}
+                    }
+                }
+                val req = try {
+                    setupAppendEntries(s, s.nextIndex.value, lastIndex)
+                } catch (e: ErrLogNotFound) {
+                    sm = SEND_SNAP
+                    continue@SM
+                } catch (e: Exception) {
+                    return false
+                }
+
+                val resp = try {
+                    transport.appendEntries(s.serverPeer.peer, req)
+                } catch (e: Exception) {
+                    logger.error("failed to appendEntries to peer={}", s.serverPeer, e)
+                    s.failures++
+                    return false
+                }
+                // Check for a newer term, stop running
+                if (resp.term > req.term) {
+                    handleStaleTerm(s)
+                    return true
+                }
+
+                // Update the last contact
+                s.setLastContact()
+
+                // Update s based on success
+                if (resp.success) {
+                    // Update our replication state
+                    updateLastAppended(s, req)
+
+                    // Clear any failures, allow pipelining
+                    s.failures = 0
+                    s.allowPipeline = true
+                } else {
+                    s.nextIndex.update { maxOf(minOf(it - 1, resp.lastLog + 1), 1) }
+                    if (resp.noRetryBackoff) {
+                        s.failures = 0
+                    } else {
+                        s.failures++
+                    }
+                    logger.warn(
+                        "appendEntries rejected, sending older logs, peer={}, next={}",
+                        s.serverPeer,
+                        s.nextIndex.value
+                    )
+                }
+                sm = CHECK_MORE
+                continue@SM
+            }
+            is CHECK_MORE -> {
+                // Poll the stop channel here in case we are looping and have been asked
+                // to stop, or have stepped down as leader. Even for the best effort case
+                // where we are asked to replicate to a given index and then shutdown,
+                // it's better to not loop in here to send lots of entries to a straggler
+                // that's leaving the cluster anyways.
+                if (s.stopCh.tryReceive().isSuccess) {
+                    return true
+                }
+
+                if (s.nextIndex.value <= lastIndex) {
+                    sm = START
+                    continue@SM
+                }
+                return false
+            }
+            is SEND_SNAP -> {
+                // SEND_SNAP is used when we fail to get a log, usually because the follower
+                // is too far behind, and we must ship a snapshot down instead
+                val stop = try {
+                    sendLatestSnapshot(s)
+                } catch (e: Exception) {
+                    logger.error("failed to send snapshot to, peer={}", s.serverPeer, e)
+                    return false
+                }
+                if (stop) return true
+                sm = CHECK_MORE
+                continue@SM
+            }
+        }
     }
 
-    private fun heartbeat(s: FollowerReplication, stopHeartbeat: Channel<Unit>) {
-        TODO("Not yet implemented")
+    // sendLatestSnapshot is used to send the latest snapshot we have
+    // down to our follower.
+    private suspend fun sendLatestSnapshot(s: FollowerReplication): Boolean {
+        val snapList = snapshots.list()
+        val snapId = snapList.firstOrNull()
+        if (snapId == null) {
+            logger.warn("no snapshots found")
+            return false
+        }
+        val (meta, snapshot) = snapshots.open(snapId.id)
+        return try {
+            val req = Rpc.InstallSnapshotRequest(
+                header = header,
+                snapshotVersion = meta.version,
+                term = s.currentTerm,
+                leader = localPeer,
+                lastLogIndex = meta.position.index,
+                lastLogTerm = meta.position.term,
+                configuration = meta.configuration,
+                configurationIndex = meta.configurationIndex,
+                size = meta.size
+            )
+            val resp = try {
+                transport.installSnapshot(s.serverPeer.peer, req, snapshot)
+            } catch (e: Exception) {
+                logger.error("failed to install snapshot, id={}", snapId, e)
+                s.failures++
+                return false
+            }
+            // Check for a newer term, stop running
+            if (resp.term > req.term) {
+                handleStaleTerm(s)
+                return true
+            }
+            setLastContact()
+            // Check for success
+            if (resp.success) {
+                // Update the indexes
+                s.nextIndex.value = meta.position.index + 1
+                s.commitment.match(s.serverPeer.serverId, meta.position.index)
+
+                // Clear any failures
+                s.failures = 0
+
+                // Notify we are still leader
+                s.notifyAll(true)
+            } else {
+                s.failures++
+                logger.warn("installSnapshot rejected to, peer={}", s.serverPeer)
+            }
+
+            false
+        } finally {
+            snapshot.close()
+        }
+    }
+
+    // heartbeat is used to periodically invoke AppendEntries on a peer
+// to ensure they don't time out. This is done async of replicate(),
+// since that routine could potentially be blocked on disk IO.
+    suspend fun heartbeat(s: FollowerReplication, stopCh: Channel<Unit>) {
+        var failures: Long = 0
+        val req = Rpc.AppendEntriesRequest(
+            header = header,
+            term = s.currentTerm,
+            leader = localPeer,
+            prevLogEntry = 0,
+            prevLogTerm = 0,
+            entries = emptyList(),
+            leaderCommitIndex = 0
+        )
+        while (true) {
+            val ret = select<Boolean> {
+                s.notifyCh.onReceive { false }
+                onTimeout((config.value.heartbeatTimeout / 10).inWholeMilliseconds) { false }
+                stopCh.onReceive { true }
+            }
+            if (ret) return
+            try {
+                val resp = transport.appendEntries(s.serverPeer.peer, req)
+                setLastContact()
+                failures = 0
+                s.notifyAll(resp.success)
+            } catch (e: Exception) {
+                logger.error("failed to heartbeat to, peer={}", s.serverPeer)
+                failures++
+                select<Unit> {
+                    onTimeout(backoff(FAILURE_WAIT, failures, MAX_FAILURE_SCALE).inWholeMilliseconds) {}
+                    stopCh.onReceive {}
+                }
+            }
+        }
+    }
+
+    private suspend fun pipelineReplicate(s: FollowerReplication) {
+        // Create a new pipeline
+        var pipeline: AppendPipeline? = null
+        try {
+            pipeline = transport.appendEntriesPipeline(s.serverPeer.peer)
+            // Log start of pipeline
+            logger.info("pipelining replication, peer={}", s.serverPeer.peer)
+
+            // Create a shutdown and finish channel
+            val stopCh = Channel<Unit>()
+            val finishCh = Channel<Unit>()
+
+            // Start a dedicated decoder
+            scope.launch { pipelineDecode(s, pipeline, stopCh, finishCh) }
+
+            // Start pipeline sends at the last good nextIndex
+            val nextIdx = MutableLong(s.nextIndex.value)
+
+            var shouldStop = false
+            SEND@ while (!shouldStop) {
+                val done = select<Boolean> {
+                    finishCh.onReceive { true }
+                    s.stopCh.onReceive { maxIndex ->
+                        if (maxIndex > 0) {
+                            pipelineSend(s, pipeline, nextIdx, maxIndex)
+                        }
+                        true
+                    }
+                    s.triggerDeferErrorCh.onReceive { deferErr ->
+                        val lastLogIdx = raftState.getLastLog().index
+                        shouldStop = pipelineSend(s, pipeline, nextIdx, lastLogIdx)
+                        if (!shouldStop) {
+                            deferErr.respond(null)
+                        } else {
+                            deferErr.respond(Unspecified("replication failed"))
+                        }
+                        false
+                    }
+                    s.triggerCh.onReceive {
+                        val lastLogIdx = raftState.getLastLog().index
+                        shouldStop = pipelineSend(s, pipeline, nextIdx, lastLogIdx)
+                        false
+                    }
+                    onTimeout(calcRandomTimeout(config.value.commitTimeout)) {
+                        val lastLogIdx = raftState.getLastLog().index
+                        shouldStop = pipelineSend(s, pipeline, nextIdx, lastLogIdx)
+                        false
+                    }
+
+                }
+                if (done) break
+            }
+            stopCh.close()
+            // Stop our decoder, and wait for it to finish
+            select<Unit> {
+                finishCh.onReceive {}
+                shutdownCh.onReceive {}
+            }
+        } finally {
+            pipeline?.close()
+            // Log stop of pipeline
+            logger.info("aborting pipeline replication, peer={}", s.serverPeer.peer)
+        }
+
     }
 
     private suspend fun leaderLoop() {
@@ -1763,3 +1954,18 @@ sealed class ReplicateStateMachine {
     object PIPELINE : ReplicateStateMachine()
 }
 
+private sealed class ReplicateToStateMachine {
+    object START : ReplicateToStateMachine()
+    object CHECK_MORE : ReplicateToStateMachine()
+    object SEND_SNAP : ReplicateToStateMachine()
+}
+
+private class MutableLong(value: Long) {
+    private val inner = atomic(value)
+
+    var value: Long
+        get() = inner.value
+        set(value) {
+            inner.value = value
+        }
+}

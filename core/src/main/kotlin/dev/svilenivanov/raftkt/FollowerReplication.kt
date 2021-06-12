@@ -11,7 +11,7 @@ import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
 import kotlin.time.Duration.Companion.milliseconds
 
-const val MAX_FAILURE_SCALE = 12
+const val MAX_FAILURE_SCALE = 12L
 val FAILURE_WAIT = milliseconds(10)
 
 // ErrLogNotFound indicates a given log entry is not available.

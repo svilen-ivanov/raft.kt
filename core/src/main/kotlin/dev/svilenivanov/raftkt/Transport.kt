@@ -17,6 +17,15 @@ interface Transport {
         TODO()
     }
 
+    fun appendEntries(peer: Peer, req: Rpc.AppendEntriesRequest): Rpc.AppendEntriesResponse
+    fun installSnapshot(
+        peer: Peer,
+        req: Rpc.InstallSnapshotRequest,
+        snapshot: ReadCloser
+    ): Rpc.InstallSnapshotResponse {
+        TODO("Not yet implemented")
+    }
+
     val consumer: ReceiveChannel<Message<Rpc.Request, Rpc.Response>>
     val localAddr: ServerAddress
 }

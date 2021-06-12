@@ -26,7 +26,7 @@ interface Transport {
         TODO("Not yet implemented")
     }
 
-    val consumer: ReceiveChannel<Message<Rpc.Request, Rpc.Response>>
+    val consumerCh: ReceiveChannel<Message<Rpc.Request, Rpc.Response>>
     val localAddr: ServerAddress
 }
 

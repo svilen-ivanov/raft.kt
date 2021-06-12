@@ -37,8 +37,8 @@ import kotlin.time.Duration.Companion.milliseconds
 // Increasing beyond this risks RPC IO taking too long and preventing
 // timely heartbeat signals which are sent in serial in current transports,
 // potentially causing leadership instability.
-const val SuggestedMaxDataSize = 512 * 1024
-val minCheckInterval = milliseconds(10)
+const val SUGGESTED_MAX_DATA_SIZE = 512 * 1024
+val MIN_CHECK_INTERVAL = milliseconds(10)
 
 sealed class RaftError(message: String) : Throwable(message) {
     class Unspecified : RaftError {
@@ -61,10 +61,10 @@ sealed class RaftError(message: String) : Throwable(message) {
     class ErrUnexpectedRequest(request: Rpc.Request) : RaftError("expected heartbeat, got ${request::class}")
 }
 
-class Raft<T, E, R> private constructor(
+class Raft<T, R> private constructor(
     config: Config,
     // FSM is the client state machine to apply commands to
-    private val fsm: Fsm<T, E, R>,
+    private val fsm: Fsm<T, R>,
     // LogStore provides durable storage for logs
     private val logs: LogStore,
     // stable is a StableStore implementation for durable state
@@ -79,22 +79,82 @@ class Raft<T, E, R> private constructor(
     // clock
     private val clock: Clock = Clock.System
 ) {
-    val scope = CoroutineScope(context)
+    private val scope = CoroutineScope(context)
 
     companion object {
         @JvmStatic
         private val logger: Logger = LoggerFactory.getLogger(Raft::class.java)
 
-        suspend fun <T, E, R> create(
+        suspend fun <T, R> create(
             config: Config,
-            fsm: Fsm<T, E, R>,
+            fsm: Fsm<T, R>,
             logs: LogStore,
             stable: StableStore,
             snaps: SnapshotStore,
             transport: Transport,
             context: CoroutineContext
-        ): Raft<T, E, R> {
+        ): Raft<T, R> {
             return Raft(config, fsm, logs, stable, snaps, transport, context).apply { init() }
+        }
+
+        /**
+         * BootstrapCluster initializes a server's storage with the given cluster
+         * configuration. This should only be called at the beginning of time for the
+         * cluster with an identical configuration listing all Voter servers. There is
+         * no need to bootstrap Nonvoter and Staging servers.
+         *
+         * A cluster can only be bootstrapped once from a single participating Voter
+         * server. Any further attempts to bootstrap will return an error that can be
+         * safely ignored.
+         *
+         * One approach is to bootstrap a single server with a configuration
+         * listing just itself as a Voter, then invoke AddVoter() on it to add other
+         * servers to the cluster.
+         */
+        suspend fun bootstrapCluster(
+            conf: Config,
+            logs: LogStore,
+            stable: StableStore,
+            snaps: SnapshotStore,
+            trans: Transport,
+            configuration: Configuration,
+            clock: Clock
+        ) {
+            configuration.check()
+
+            // Make sure the cluster is in a clean state.
+            val hasState = hasExistingState(logs, stable, snaps)
+            if (hasState) {
+                throw ErrCantBootstrap
+            }
+            stable.set(Key.CURRENT_TERM, 1L)
+            // Append configuration entry to log.
+            val entry = Log(
+                position = Position(1, 1),
+                appendedAt = clock.now(),
+                data = Log.Data.Configuration(configuration)
+            )
+            logs.storeLog(entry)
+        }
+
+        /**
+         *  HasExistingState returns true if the server has any existing state (logs,
+         *  knowledge of a current term, or any snapshots).
+         */
+        private suspend fun hasExistingState(logs: LogStore, stable: StableStore, snaps: SnapshotStore): Boolean {
+            val currentTerm = stable.get<Long>(Key.CURRENT_TERM)
+            when {
+                currentTerm == null -> return false
+                currentTerm > 0 -> return true
+            }
+            val lastIndex = logs.lastIndex()
+            when {
+                lastIndex == null -> return false
+                lastIndex > 0 -> return true
+            }
+            val snapshots = snaps.list()
+            val firstSnap = snapshots.firstOrNull()
+            return firstSnap == null
         }
     }
 
@@ -206,11 +266,13 @@ class Raft<T, E, R> private constructor(
     private var notifyCh: Channel<Boolean>? = null
 
     private val raftState = RaftState()
+
     private lateinit var rpc: Channel<Rpc>
     private lateinit var groupJob: Job
+
     private val header = RpcHeader(protocolVersion = config.protocolVersion)
 
-    @Suppress("UNUSED_VARIABLE")
+
     suspend fun init() {
         val currentTerm = stable.get<Long>(Key.CURRENT_TERM) ?: 0
         val lastIndex = logs.lastIndex()
@@ -231,7 +293,7 @@ class Raft<T, E, R> private constructor(
         fsmSnapshotCh = Channel()
         leaderCh = Channel(1)
         configurationChangeCh = Channel()
-        rpcCh = transport.consumer
+        rpcCh = transport.consumerCh
         userSnapshotCh = Channel()
         userRestoreCh = Channel()
         verifyCh = Channel(64)
@@ -500,7 +562,7 @@ class Raft<T, E, R> private constructor(
      */
     private suspend fun startStopReplication() {
         val inConfig = mutableMapOf<ServerId, Boolean>()
-        var lastIdx = raftState.getLastIndex()
+        val lastIdx = raftState.getLastIndex()
 
         for (server in configurations.latest.servers) {
             if (server.peer.id == localPeer.id) continue
@@ -1224,7 +1286,7 @@ class Raft<T, E, R> private constructor(
                             val maxDiff = checkLeaderLease()
                             // Next check interval should adjust for the last node we've
                             // contacted, without going negative
-                            val checkInterval = maxOf(minCheckInterval, config.value.leaderLeaseTimeout - maxDiff)
+                            val checkInterval = maxOf(MIN_CHECK_INTERVAL, config.value.leaderLeaseTimeout - maxDiff)
                             fixedTimeout(lease, checkInterval)
                         }
                         shutdownCh.onReceive { }

@@ -10,7 +10,7 @@ import kotlin.coroutines.coroutineContext
 
 // FSM provides an interface that can be implemented by
 // clients to make use of the replicated log.
-interface Fsm<T, E, R> {
+interface Fsm<T, R> {
     // Apply log is invoked once a log entry is committed.
     // It returns a value which will be made available in the
     // ApplyFuture returned by Raft.Apply method if that
@@ -34,7 +34,7 @@ interface Fsm<T, E, R> {
 // BatchingFSM extends the FSM interface to add an ApplyBatch function. This can
 // optionally be implemented by clients to enable multiple logs to be applied to
 // the FSM in batches. Up to MaxAppendEntries could be sent in a batch.
-interface BatchingFSM<T, E, R> : Fsm<T, E, R> {
+interface BatchingFSM<T, R> : Fsm<T, R> {
     // ApplyBatch is invoked once a batch of log entries has been committed and
     // are ready to be applied to the FSM. ApplyBatch will take in an array of
     // log entries. These log entries will be in the order they were committed,
@@ -61,9 +61,9 @@ interface FsmSnapshot {
     suspend fun release()
 }
 
-class FsmRunner<T, E, R>(
+class FsmRunner<T, R>(
     // FSM is the client state machine to apply commands to
-    private val fsm: Fsm<T, E, R>,
+    private val fsm: Fsm<T, R>,
 
     // fsmMutateCh is used to send state-changing updates to the FSM. This
     // receives pointers to commitTuple structures when applying logs or

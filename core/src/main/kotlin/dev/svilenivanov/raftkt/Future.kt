@@ -124,7 +124,7 @@ class BootstrapFuture<R>(
     val configuration: Configuration
 ) : LogFuture<R>()
 
-class ShutdownFuture<T, E, R>(val raft: Raft<T, E, R>? = null) : Future {
+class ShutdownFuture<T, R>(val raft: Raft<T, R>? = null) : Future {
 
     override suspend fun error(): RaftError? {
         if (raft == null) return null

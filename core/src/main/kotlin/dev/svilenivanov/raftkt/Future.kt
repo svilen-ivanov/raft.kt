@@ -4,7 +4,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import java.time.Instant
+import kotlinx.datetime.Instant
 
 // Future is used to represent an action that may occur in the future.
 private interface Future {
@@ -219,7 +219,7 @@ class ConfigurationsFuture(var configurations: Configurations?) : DeferError() {
 class AppendFuture(
     var start: Instant?,
     var args: Rpc.AppendEntriesRequest?,
-    var resp: Rpc.AppendEntriesResponse?
+    var resp: Rpc.AppendEntriesResponse? = null
 ) : DeferError() {
     fun request() = args!!
     fun response() = resp!!

@@ -1449,7 +1449,7 @@ class Raft<T, R> private constructor(
 
             // Step 3: send TimeoutNow message to target server.
             try {
-                transport.timoutNow(peer)
+                transport.timoutNow(peer, Rpc.TimeoutNowRequest(header))
                 doneCh.send(null)
             } catch (e: Exception) {
                 doneCh.send(Unspecified(e))

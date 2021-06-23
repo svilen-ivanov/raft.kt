@@ -1,3 +1,3 @@
 rootProject.name = "raftkt"
-include("core", "inmem")
+include("core", "core2", "inmem")
 

@@ -4,7 +4,8 @@ package dev.svilenivanov.raftkt
 
 import dev.svilenivanov.raftkt.Observation.LeaderObservation
 import dev.svilenivanov.raftkt.RaftError.*
-import dev.svilenivanov.raftkt.ReplicateStateMachine.*
+import dev.svilenivanov.raftkt.ReplicateStateMachine.PIPELINE
+import dev.svilenivanov.raftkt.ReplicateStateMachine.RPC
 import dev.svilenivanov.raftkt.ReplicateToStateMachine.*
 import dev.svilenivanov.raftkt.ServerSuffrage.VOTER
 import dev.svilenivanov.raftkt.State.*
@@ -328,7 +329,7 @@ class Raft<T, R> private constructor(
         transport.setHeartbeatHandler(this::processHeartbeat)
         if (config.value.skipStartup) return
 
-        groupJob = supervisorScope {
+        groupJob = scope.launch {
             launch { run() }
             launch { runFsm() }
             launch { runSnapshots() }
@@ -336,11 +337,9 @@ class Raft<T, R> private constructor(
     }
 
     private fun runSnapshots() {
-        TODO("Not yet implemented")
     }
 
     private fun runFsm() {
-        TODO("Not yet implemented")
     }
 
     private fun processConfigLogEntry(entry: Log) {
@@ -357,8 +356,8 @@ class Raft<T, R> private constructor(
     }
 
     private suspend fun restoreSnapshot() {
-        val snapshot = snapshots.list().firstOrNull()
-            ?: throw IllegalStateException("failed to load any existing snapshots")
+        val snapshot = snapshots.list().firstOrNull() ?: return
+
         if (!config.value.noSnapshotRestoreOnStart) {
             val source = snapshots.open(snapshot.id)
             fsm.restore(source)
@@ -384,7 +383,7 @@ class Raft<T, R> private constructor(
 
     private suspend fun run() {
         while (context.isActive) {
-            if (shutdownCh.tryReceive().isSuccess) {
+            if (shutdownCh.tryReceive().isClosed) {
                 setLeader(null)
                 return
             }
@@ -404,53 +403,60 @@ class Raft<T, R> private constructor(
         var didWarn = false
         logger.info("entering follower state: follower={}, leader={}", localPeer, this.leader.value)
 
-        coroutineScope {
-            val heartbeatTimer = Channel<Unit>()
-            randomTimeout(heartbeatTimer, config.value.heartbeatTimeout)
-            while (isActive && raftState.getState() == FOLLOWER) {
-                select<Unit> {
-                    rpcCh.onReceive { processRpc(it) }
-                    configurationChangeCh.onReceive { respondNotLeader(it) }
-                    applyCh.onReceive { respondNotLeader(it) }
-                    verifyCh.onReceive { respondNotLeader(it) }
-                    userRestoreCh.onReceive { respondNotLeader(it) }
-                    leadershipTransferCh.onReceive { respondNotLeader(it) }
-                    configurationsCh.onReceive { c ->
-                        c.configurations = configurations
-                    }
-                    bootstrapCh.onReceive { b ->
-                        b.respond(
-                            try {
-                                liveBootstrap(b.configuration)
-                                null
-                            } catch (e: Exception) {
-                                Unspecified(e)
-                            }
-                        )
-                    }
-                    heartbeatTimer.onReceive {
-                        val hbTimeout = config.value.heartbeatTimeout
-                        randomTimeout(heartbeatTimer, hbTimeout)
-                        if (clock.now().minus(lastContact.value) >= hbTimeout) {
-                            val lastLeader = setLeader(null)
-                            if (configurations.latestIndex == 0L) {
-                                logger.warn("no known peers, aborting election")
-                            } else if (configurations.latestIndex == configurations.committedIndex
-                                && !configurations.latest.hasVote(localId)
-                            ) {
-                                logger.warn("not part of stable configuration, aborting election")
-                            } else {
-                                logger.warn("heartbeat timeout reached, starting election, last-leader={}", lastLeader)
-                                raftState.setState(CANDIDATE)
-                                cancel("heartbeat timeout reached, starting election")
+        try {
+            coroutineScope {
+                val heartbeatTimer = Channel<Unit>()
+                randomTimeout(heartbeatTimer, config.value.heartbeatTimeout)
+                while (isActive && raftState.getState() == FOLLOWER) {
+                    val done = select<Unit> {
+                        rpcCh.onReceive { processRpc(it) }
+                        configurationChangeCh.onReceive { respondNotLeader(it) }
+                        applyCh.onReceive { respondNotLeader(it) }
+                        verifyCh.onReceive { respondNotLeader(it) }
+                        userRestoreCh.onReceive { respondNotLeader(it) }
+                        leadershipTransferCh.onReceive { respondNotLeader(it) }
+                        configurationsCh.onReceive { c ->
+                            c.configurations = configurations
+                        }
+                        bootstrapCh.onReceive { b ->
+                            b.respond(
+                                try {
+                                    liveBootstrap(b.configuration)
+                                    null
+                                } catch (e: Exception) {
+                                    Unspecified(e)
+                                }
+                            )
+                        }
+                        heartbeatTimer.onReceive {
+                            val hbTimeout = config.value.heartbeatTimeout
+                            randomTimeout(heartbeatTimer, hbTimeout)
+                            if (clock.now().minus(lastContact.value) >= hbTimeout) {
+                                val lastLeader = setLeader(null)
+                                if (configurations.latestIndex == 0L) {
+                                    logger.warn("no known peers, aborting election")
+                                } else if (configurations.latestIndex == configurations.committedIndex
+                                    && !configurations.latest.hasVote(localId)
+                                ) {
+                                    logger.warn("not part of stable configuration, aborting election")
+                                } else {
+                                    logger.warn(
+                                        "heartbeat timeout reached, starting election, last-leader={}",
+                                        lastLeader
+                                    )
+                                    raftState.setState(CANDIDATE)
+                                    cancel("heartbeat timeout reached, starting election")
+                                }
                             }
                         }
-                    }
-                    shutdownCh.onReceive {
-                        cancel("shutting down")
+                        shutdownCh.onReceiveCatching {
+                            if (!it.isClosed) cancel("shutting down")
+                        }
                     }
                 }
             }
+        } catch (e: CancellationException) {
+            logger.info("Canceled: {}", e.message)
         }
     }
 
@@ -483,7 +489,7 @@ class Raft<T, R> private constructor(
                             }
                             // Check if we've become the leader
                             if (grantedVotes >= votesNeeded) {
-                                logger.info("election won, tally={}", grantedVotes)
+                                logger.info("{}: election won, tally={}", localPeer, grantedVotes)
                                 raftState.setState(LEADER)
                                 setLeader(localPeer)
                             }
@@ -501,8 +507,8 @@ class Raft<T, R> private constructor(
                             logger.warn("Election timeout reached, restarting election")
                             cancel("election timeout")
                         }
-                        shutdownCh.onReceive {
-                            cancel("shutting down")
+                        shutdownCh.onReceiveCatching {
+                            if (!it.isClosed) cancel("shutting down")
                         }
                     }
                 }
@@ -530,7 +536,7 @@ class Raft<T, R> private constructor(
         if (notify != null) {
             select<Unit> {
                 notify.onSend(true) {}
-                shutdownCh.onReceive {}
+                shutdownCh.onReceiveCatching {}
             }
         }
 
@@ -826,7 +832,7 @@ class Raft<T, R> private constructor(
                 if (s.failures > 0) {
                     select<Unit> {
                         onTimeout(backoff(FAILURE_WAIT, s.failures, MAX_FAILURE_SCALE).inWholeMilliseconds) {}
-                        shutdownCh.onReceive {}
+                        shutdownCh.onReceiveCatching {}
                     }
                 }
                 val req = try {
@@ -1060,7 +1066,7 @@ class Raft<T, R> private constructor(
             // Stop our decoder, and wait for it to finish
             select<Unit> {
                 finishCh.onReceive {}
-                shutdownCh.onReceive {}
+                shutdownCh.onReceiveCatching {}
             }
         } finally {
             pipeline?.close()
@@ -1289,7 +1295,7 @@ class Raft<T, R> private constructor(
                             val checkInterval = maxOf(MIN_CHECK_INTERVAL, config.value.leaderLeaseTimeout - maxDiff)
                             fixedTimeout(lease, checkInterval)
                         }
-                        shutdownCh.onReceive { }
+                        shutdownCh.onReceiveCatching { }
                     }
                 }
             }
@@ -1392,7 +1398,7 @@ class Raft<T, R> private constructor(
 
     }
 
-    private suspend fun shutdownFn() = shutdownLock.withLock {
+    suspend fun shutdownFn() = shutdownLock.withLock {
         if (!shutdown) {
             shutdownCh.close()
             shutdown = true
@@ -1539,9 +1545,9 @@ class Raft<T, R> private constructor(
         if (notify != null) {
             select<Unit> {
                 notify.onSend(false) {}
-                shutdownCh.onReceive {
+                shutdownCh.onReceiveCatching {
                     // On shutdown, make a best effort but do not block
-                    notify.trySend(false)
+                    if (!it.isClosed) notify.trySend(false)
                 }
             }
         }
@@ -1943,8 +1949,10 @@ class Raft<T, R> private constructor(
     private suspend fun applyBatch(batch: List<CommitTuple<R>>) {
         select<Unit> {
             fsmMutateCh.onSend(batch) {}
-            shutdownCh.onReceive {
-                batch.forEach { cl -> cl.future?.respond(ErrRaftShutdown) }
+            shutdownCh.onReceiveCatching {
+                if (!it.isClosed) {
+                    batch.forEach { cl -> cl.future?.respond(ErrRaftShutdown) }
+                }
             }
         }
     }
@@ -1968,11 +1976,11 @@ class Raft<T, R> private constructor(
     }
 
     suspend fun waitShutdown() {
-        TODO("Not yet implemented")
+        groupJob.join()
     }
 
     suspend fun closeTransport() {
-        if (transport is Closer) {
+        if (transport is WithClose) {
             transport.close()
         }
     }

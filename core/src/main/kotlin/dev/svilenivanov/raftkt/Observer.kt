@@ -12,6 +12,5 @@ sealed class Observation {
 
 class Observers {
     fun observe(observation: Observation) {
-        TODO()
     }
 }

@@ -61,7 +61,7 @@ class InmemTransport(
     override val localAddr: ServerAddress = ServerAddress("server #${IdGenerator.next()}"),
     override val consumerCh: Channel<Message<Rpc.Request, Rpc.Response>> = Channel(),
     private val timeout: Duration,
-    private val clock: Clock
+    private val clock: Clock = Clock.System
 ) : LoopbackTransport {
 
     companion object {

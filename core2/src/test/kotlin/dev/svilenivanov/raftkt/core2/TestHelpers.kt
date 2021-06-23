@@ -15,7 +15,7 @@ private object IdGenerator {
 }
 
 fun randomNode(id: String? = IdGenerator.nextId().toString()): Node {
-    return Node(ServerId("ID #$id"), ServerAddress("Address #$id"))
+    return Node(ServerId("<id $id>"), ServerAddress("<address $id>"))
 }
 
 @JvmInline

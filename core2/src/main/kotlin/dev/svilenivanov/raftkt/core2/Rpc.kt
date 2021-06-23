@@ -107,8 +107,9 @@ class RpcHandler(
         if (req.term > persistent.currentTerm || role != FOLLOWER) {
             persistent.currentTerm = req.term
             logger.info(marker, "Stepping down due to receiving append entries with term {}", req.term)
-            throw RaftException.StepDown()
+            // TODO: step down
         }
+
         leader = req.leader.id
         // Ignore an older term
         if (req.term < persistent.currentTerm) {
@@ -198,6 +199,13 @@ class RpcHandler(
 
     private fun Consensus.requestVote(req: Rpc.RequestVoteRequest): Rpc.RequestVoteResponse {
         val votedFor = persistent.votedFor
+
+        if (req.term > persistent.currentTerm) {
+            persistent.currentTerm = req.term
+            logger.info(marker, "Stepping down due to receiving new term {}", req.term)
+            // TODO: step down
+        }
+
         val granted = when {
             // Check if we have an existing leader [who's not the candidate] and also
             // check the LeadershipTransfer flag is set. Usually votes are rejected if
@@ -207,11 +215,7 @@ class RpcHandler(
                 logger.warn(marker, "rejecting vote request from {} since we have a leader {}", req.candidate, leader)
                 false
             }
-            req.term > persistent.currentTerm -> {
-                persistent.currentTerm = req.term
-                logger.info(marker, "Stepping down due to receiving new term {}", req.term)
-                throw RaftException.StepDown()
-            }
+
             req.term < persistent.currentTerm -> {
                 logger.debug(
                     marker,
@@ -222,17 +226,15 @@ class RpcHandler(
                 )
                 false
             }
-            votedFor == null -> {
-                logger.debug(marker, "granting vote to candidate {} for term {}", req.candidate, req.term)
-                persistent.votedFor = VoteFor(req.candidate.id, req.term)
-                true
-            }
-            votedFor.term == req.term -> {
-                logger.warn(marker, "duplicate requestVote for same term {}", req.term)
+            votedFor != null && votedFor.term == req.term -> {
                 val granted = votedFor.id == req.candidate.id
-                if (granted) {
-                    logger.warn(marker, "duplicate requestVote from candidate {}", req.candidate)
-                }
+                logger.warn(
+                    marker,
+                    "duplicate requestVote for same term {} from {} (granted={})",
+                    req.term,
+                    req.candidate,
+                    granted
+                )
                 granted
             }
             persistent.lastLog.term > req.lastLog.term
@@ -246,7 +248,17 @@ class RpcHandler(
                 )
                 false
             }
-            else -> true
+            else -> {
+                logger.debug(
+                    marker,
+                    "granting vote request to {} because its log is at least as up to date ({}) as ours ({})",
+                    req.candidate,
+                    req.lastLog,
+                    persistent.lastLog
+                )
+                persistent.votedFor = VoteFor(req.candidate.id, req.term)
+                true
+            }
         }
         return Rpc.RequestVoteResponse(
             header = header,

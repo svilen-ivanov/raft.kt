@@ -9,6 +9,19 @@ plugins {
     }
 }
 
+val overrideVersions = mapOf(
+    "net.bytebuddy" to "1.11.5" // bump bytebuddy to latest supported Java 16 version (mockk dep)
+)
+
+configurations.all {
+    resolutionStrategy.eachDependency {
+        overrideVersions[requested.module.group]?.let { v ->
+            useVersion(v)
+            because("Add Java 16 support (mockk)")
+        }
+    }
+}
+
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:${Version.coroutines}")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-core:${Version.serialization}")
@@ -22,4 +35,5 @@ dependencies {
     testImplementation("io.kotest:kotest-property:${Version.kotest}")
     testRuntimeOnly("org.apache.logging.log4j:log4j-slf4j-impl:${Version.log4j2}")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:${Version.coroutines}")
+    testImplementation("io.mockk:mockk:${Version.mockk}")
 }

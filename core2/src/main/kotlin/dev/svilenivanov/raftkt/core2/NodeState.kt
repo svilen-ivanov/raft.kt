@@ -14,11 +14,12 @@ interface CommandResponse
 
 data class Message<REQ, RES>(
     val request: REQ,
-    val response: CompletableDeferred<RES> = CompletableDeferred()
+    val response: Deferred<RES> = CompletableDeferred()
 ) {
-    suspend fun respond(block: suspend () -> RES) {
+    suspend fun respond(block: suspend (req: REQ) -> RES) {
+        response as CompletableDeferred
         try {
-            response.complete(block())
+            response.complete(block(request))
         } catch (t: Throwable) {
             response.completeExceptionally(t)
         }

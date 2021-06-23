@@ -18,4 +18,8 @@ class InmemLogStore : LogStore {
     override suspend fun deleteRange(range: LongRange) = lock.withLock {
         range.forEach(logs::remove)
     }
+
+    internal suspend fun storeLogs(logs: List<Log>) {
+        logs.forEach { storeLog(it) }
+    }
 }

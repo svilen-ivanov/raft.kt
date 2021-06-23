@@ -3,7 +3,7 @@
 package dev.svilenivanov.raftkt.core2
 
 import dev.svilenivanov.raftkt.core2.NodeRole.FOLLOWER
-import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.awaitAll
 import kotlinx.datetime.Clock
 import kotlinx.serialization.Serializable
 import org.slf4j.Logger
@@ -85,6 +85,7 @@ sealed class Rpc : WithHeader {
 
 class RpcHandler(
     private val consensus: Consensus,
+    private val fsmApply: FsmApply,
     private val marker: Marker,
     private val header: RpcHeader,
     private val clock: Clock
@@ -134,7 +135,13 @@ class RpcHandler(
                 persistent.log.getLog(req.prevLog.index)?.position?.term
             }
             if (prevLogTerm != req.prevLog.term) {
-                logger.warn(marker, "previous log term mis-match, ours {}, remote {}", prevLogTerm, req.prevLog.term)
+                logger.warn(
+                    marker,
+                    "previous log term mis-match at index {}, our log entry term {}, remote log entry term {}",
+                    req.prevLog.index,
+                    prevLogTerm,
+                    req.prevLog.term
+                )
                 return Rpc.AppendEntriesResponse(
                     header = header,
                     term = persistent.currentTerm,
@@ -176,7 +183,7 @@ class RpcHandler(
         if (req.leaderCommitIndex > 0 && req.leaderCommitIndex > volatile.commitIndex) {
             val idx = minOf(req.leaderCommitIndex, persistent.lastLog.index)
             volatile.commitIndex = idx
-            processLogs(idx)
+            fsmApply.processLogs(this, idx)
         }
 
         return Rpc.AppendEntriesResponse(
@@ -188,17 +195,6 @@ class RpcHandler(
         )
     }
 
-    private suspend fun Consensus.processLogs(idx: Long) {
-        if (idx <= volatile.lastApplied) {
-            logger.warn("skipping application of old log at index {} (lastApplied is {})", idx, volatile.lastApplied)
-        }
-        ((volatile.lastApplied + 1)..idx).asFlow().map {
-            persistent.log.getLog(it)
-        }.buffer().collect {
-            TODO()
-        }
-        volatile.lastApplied = idx
-    }
 
     private fun Consensus.requestVote(req: Rpc.RequestVoteRequest): Rpc.RequestVoteResponse {
         val votedFor = persistent.votedFor
@@ -243,8 +239,9 @@ class RpcHandler(
                     || (persistent.lastLog.term == req.lastLog.term && persistent.lastLog.index > req.lastLog.index) -> {
                 logger.warn(
                     marker,
-                    "rejecting vote request since our position {} is greater from candidate {} position {}",
+                    "rejecting vote request since our position {} is greater than candidate's {} position {}",
                     persistent.lastLog,
+                    req.candidate,
                     req.lastLog
                 )
                 false

@@ -31,7 +31,7 @@ class EchoFsm : Fsm {
         val logger: Logger = LoggerFactory.getLogger(EchoFsm::class.java)
     }
 
-    override fun apply(command: CommandRequest): CommandResponse {
+    override suspend fun apply(command: CommandRequest): CommandResponse {
         command as StringCommandRequest
         logger.debug("Echo: {}", command.str)
         return StringCommandResponse(command.str)

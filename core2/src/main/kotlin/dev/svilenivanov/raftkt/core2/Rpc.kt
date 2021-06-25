@@ -3,7 +3,6 @@
 package dev.svilenivanov.raftkt.core2
 
 import dev.svilenivanov.raftkt.core2.NodeRole.FOLLOWER
-import kotlinx.coroutines.awaitAll
 import kotlinx.datetime.Clock
 import kotlinx.serialization.Serializable
 import org.slf4j.Logger
@@ -107,7 +106,7 @@ class RpcHandler(
         if (req.term > persistent.currentTerm || role != FOLLOWER) {
             persistent.currentTerm = req.term
             logger.info(marker, "Stepping down due to receiving append entries with term {}", req.term)
-            // TODO: step down
+            role = FOLLOWER
         }
 
         leader = req.leader.id
@@ -203,7 +202,7 @@ class RpcHandler(
         if (req.term > persistent.currentTerm) {
             persistent.currentTerm = req.term
             logger.info(marker, "Stepping down due to receiving new term {}", req.term)
-            // TODO: step down
+            role = FOLLOWER
         }
 
         val granted = when {

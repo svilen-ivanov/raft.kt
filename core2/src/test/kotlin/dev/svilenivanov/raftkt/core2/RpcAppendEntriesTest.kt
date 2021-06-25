@@ -72,7 +72,7 @@ internal class RpcAppendEntriesTest {
             withClue("entry: $log") { logStore.getLog(log.position.index) shouldBe log }
         }
 
-        verifyOrder {
+        coVerifyOrder {
             entries.forEach { fsm.apply((it.data as Log.Data.CommandData).command) }
         }
     }

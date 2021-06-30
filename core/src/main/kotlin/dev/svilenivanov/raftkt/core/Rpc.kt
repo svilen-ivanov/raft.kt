@@ -1,8 +1,8 @@
 @file:Suppress("UNUSED_PARAMETER", "UNUSED_VARIABLE")
 
-package dev.svilenivanov.raftkt.core2
+package dev.svilenivanov.raftkt.core
 
-import dev.svilenivanov.raftkt.core2.NodeRole.FOLLOWER
+import dev.svilenivanov.raftkt.core.NodeRole.FOLLOWER
 import kotlinx.datetime.Clock
 import kotlinx.serialization.Serializable
 import org.slf4j.Logger

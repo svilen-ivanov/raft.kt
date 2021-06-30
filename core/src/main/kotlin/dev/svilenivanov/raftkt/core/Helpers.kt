@@ -1,4 +1,4 @@
-package dev.svilenivanov.raftkt.core2
+package dev.svilenivanov.raftkt.core
 
 import kotlinx.coroutines.CoroutineExceptionHandler
 import org.slf4j.Logger

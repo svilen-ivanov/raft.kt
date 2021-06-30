@@ -1,4 +1,4 @@
-package dev.svilenivanov.raftkt.core2
+package dev.svilenivanov.raftkt.core
 
 import kotlinx.atomicfu.atomic
 import kotlinx.datetime.Clock

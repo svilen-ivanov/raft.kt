@@ -1,4 +1,4 @@
-package dev.svilenivanov.raftkt.core2
+package dev.svilenivanov.raftkt.core
 
 interface Transport {
     var ingress: suspend (Rpc.Request) -> Rpc.Response

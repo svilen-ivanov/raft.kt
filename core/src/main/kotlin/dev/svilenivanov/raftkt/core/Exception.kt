@@ -1,4 +1,4 @@
-package dev.svilenivanov.raftkt.core2
+package dev.svilenivanov.raftkt.core
 
 sealed class RaftException: Exception() {
     class StepDown : RaftException()

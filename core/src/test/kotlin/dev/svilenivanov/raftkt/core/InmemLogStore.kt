@@ -1,4 +1,4 @@
-package dev.svilenivanov.raftkt.core2
+package dev.svilenivanov.raftkt.core
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock

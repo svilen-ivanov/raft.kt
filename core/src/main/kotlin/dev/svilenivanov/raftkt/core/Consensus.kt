@@ -1,6 +1,6 @@
-package dev.svilenivanov.raftkt.core2
+package dev.svilenivanov.raftkt.core
 
-import dev.svilenivanov.raftkt.core2.NodeRole.FOLLOWER
+import dev.svilenivanov.raftkt.core.NodeRole.FOLLOWER
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 

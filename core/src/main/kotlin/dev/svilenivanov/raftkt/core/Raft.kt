@@ -1,8 +1,8 @@
 @file:Suppress("UNUSED_PARAMETER", "UNUSED_VARIABLE")
 
-package dev.svilenivanov.raftkt.core2
+package dev.svilenivanov.raftkt.core
 
-import dev.svilenivanov.raftkt.core2.NodeRole.FOLLOWER
+import dev.svilenivanov.raftkt.core.NodeRole.FOLLOWER
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.*
